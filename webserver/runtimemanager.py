@@ -1,8 +1,10 @@
+import ipaddress
 import os
 import socket
 import subprocess
 import threading
 import time
+from pathlib import Path
 
 # psutil is optional - not available on MSYS2/Cygwin platforms
 try:
@@ -27,6 +29,14 @@ if not HAS_PSUTIL:
 MAX_RAPID_CRASHES = 3
 RAPID_CRASH_WINDOW = 30  # seconds
 
+# Hot redundancy: TCP heartbeat on redundancy NIC (ens35); standby listens, master sends
+REDUNDANCY_ROLE_FILENAME = "redundancy_role.ini"
+REDUNDANCY_NIC = "ens35"
+REDUNDANCY_HEARTBEAT_PORT = 57575
+REDUNDANCY_HB_PAYLOAD = b"OPENPLC_REDUNDANCY_HB_V1\n"
+REDUNDANCY_MASTER_HEARTBEAT_INTERVAL_SEC = 1.0
+REDUNDANCY_STANDBY_RECV_IDLE_SEC = 1.0
+
 
 class RuntimeManager:
     def __init__(self, runtime_path, plc_socket, log_socket, print_debug=False):
@@ -42,6 +52,393 @@ class RuntimeManager:
         self._crash_lock = threading.Lock()
         self._crash_times: list[float] = []
         self._safe_mode = False
+
+        # Hot redundancy (see redundancy_role.ini, NIC ens35)
+        self.is_master = False
+        self.is_redundancy = False
+        self._redundancy_master_ip: str | None = None
+        self._redundancy_standby_ip: str | None = None
+        self._redundancy_local_ens35_ip: str | None = None
+        self._heartbeat_stop = threading.Event()
+        self._heartbeat_threads: list[threading.Thread] = []
+        self._standby_hb_lost_logged = False
+
+    @staticmethod
+    def _openplc_project_root() -> Path:
+        """Repository / install root (parent of webserver/)."""
+        return Path(__file__).resolve().parent.parent
+
+    @staticmethod
+    def _ipv4_for_interface(ifname: str) -> str | None:
+        """Return first IPv4 address on interface ifname, or None."""
+        if HAS_PSUTIL and psutil is not None:
+            addrs = psutil.net_if_addrs().get(ifname)
+            if addrs:
+                for entry in addrs:
+                    if entry.family == socket.AF_INET and entry.address:
+                        return str(entry.address)
+        try:
+            out = subprocess.check_output(
+                ["ip", "-4", "-o", "addr", "show", "dev", ifname],
+                stderr=subprocess.DEVNULL,
+                text=True,
+                timeout=5,
+            )
+        except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+            return None
+        for line in out.splitlines():
+            parts = line.split()
+            for i, token in enumerate(parts):
+                if token == "inet" and i + 1 < len(parts):
+                    return parts[i + 1].split("/")[0].strip()
+        return None
+
+    @staticmethod
+    def _parse_ipv4_line(line: str) -> str | None:
+        raw = line.split("#", 1)[0].strip()
+        if not raw:
+            return None
+        try:
+            return str(ipaddress.IPv4Address(raw))
+        except ValueError:
+            return None
+
+    def _read_redundancy_role_ini(self, ini_path: Path) -> tuple[str | None, str | None]:
+        """Read configured master and standby IPv4 from redundancy_role.ini (first two IP lines)."""
+        master_ip: str | None = None
+        standby_ip: str | None = None
+        try:
+            text = ini_path.read_text(encoding="utf-8", errors="replace")
+        except OSError as e:
+            logger.error(
+                "[热冗余] 读取冗余配置文件失败: 路径=%s, 错误=%s",
+                ini_path,
+                e,
+            )
+            return None, None
+
+        line_no = 0
+        for raw_line in text.splitlines():
+            line_no += 1
+            stripped = raw_line.strip()
+            if not stripped or stripped.startswith("#"):
+                logger.debug(
+                    "[热冗余] 配置文件第 %d 行已跳过（空行或注释）: %r",
+                    line_no,
+                    raw_line[:80],
+                )
+                continue
+            ip_val = self._parse_ipv4_line(stripped)
+            if ip_val is None:
+                logger.warning(
+                    "[热冗余] 配置文件第 %d 行不是有效 IPv4，已跳过: %r",
+                    line_no,
+                    stripped[:80],
+                )
+                continue
+            if master_ip is None:
+                master_ip = ip_val
+                logger.info(
+                    "[热冗余] 从配置文件解析到主机 IPv4（第 %d 行）: %s",
+                    line_no,
+                    master_ip,
+                )
+            elif standby_ip is None:
+                standby_ip = ip_val
+                logger.info(
+                    "[热冗余] 从配置文件解析到备机 IPv4（第 %d 行）: %s",
+                    line_no,
+                    standby_ip,
+                )
+                break
+            else:
+                break
+
+        if master_ip is None or standby_ip is None:
+            logger.warning(
+                "[热冗余] 配置文件中未能解析出主机与备机两条有效 IPv4，"
+                "当前解析结果: 主机=%s, 备机=%s",
+                master_ip,
+                standby_ip,
+            )
+            return None, None
+
+        return master_ip, standby_ip
+
+    def _evaluate_redundancy_role(self) -> None:
+        """
+        Load redundancy_role.ini, compare with local ens35 address, set is_master / is_redundancy.
+        Detailed logs are in Chinese.
+        """
+        self.is_master = False
+        self.is_redundancy = False
+        self._redundancy_master_ip = None
+        self._redundancy_standby_ip = None
+        self._redundancy_local_ens35_ip = None
+
+        project_root = self._openplc_project_root()
+        ini_path = project_root / REDUNDANCY_ROLE_FILENAME
+
+        logger.info(
+            "[热冗余] 开始冗余角色检测: 项目根目录=%s, 配置文件=%s, 冗余网卡=%s",
+            project_root,
+            ini_path,
+            REDUNDANCY_NIC,
+        )
+
+        if not ini_path.is_file():
+            logger.info(
+                "[热冗余] 未找到配置文件 %s，本机不启用热冗余功能（is_redundancy=False, is_master=False）。",
+                ini_path,
+            )
+            return
+
+        logger.info("[热冗余] 已找到冗余配置文件，开始读取主机/备机 IP。")
+        master_ip, standby_ip = self._read_redundancy_role_ini(ini_path)
+        if master_ip is None or standby_ip is None:
+            logger.info(
+                "[热冗余] 配置文件内容无效，本机不启用热冗余功能（is_redundancy=False, is_master=False）。"
+            )
+            return
+
+        self._redundancy_master_ip = master_ip
+        self._redundancy_standby_ip = standby_ip
+        logger.info(
+            "[热冗余] 配置摘要: 主机 IP=%s, 备机 IP=%s（将与本机 %s 的 IPv4 比较）",
+            master_ip,
+            standby_ip,
+            REDUNDANCY_NIC,
+        )
+
+        local_ip = self._ipv4_for_interface(REDUNDANCY_NIC)
+        self._redundancy_local_ens35_ip = local_ip
+        if local_ip is None:
+            logger.error(
+                "[热冗余] 无法读取网卡 %s 的 IPv4 地址，本机不启用热冗余。"
+                "请确认网卡存在且已配置地址。",
+                REDUNDANCY_NIC,
+            )
+            return
+
+        logger.info(
+            "[热冗余] 本机网卡 %s 的 IPv4 为: %s",
+            REDUNDANCY_NIC,
+            local_ip,
+        )
+
+        if local_ip == master_ip:
+            self.is_redundancy = True
+            self.is_master = True
+            logger.info(
+                "[热冗余] 本机 IPv4 与配置中的主机一致，角色=主机。"
+                "is_redundancy=True, is_master=True。"
+                "将通过 TCP 经 %s 主动连接备机并每秒发送心跳（目标端口 %d）。",
+                REDUNDANCY_NIC,
+                REDUNDANCY_HEARTBEAT_PORT,
+            )
+            return
+
+        if local_ip == standby_ip:
+            self.is_redundancy = True
+            self.is_master = False
+            logger.info(
+                "[热冗余] 本机 IPv4 与配置中的备机一致，角色=备机。"
+                "is_redundancy=True, is_master=False。"
+                "将在 %s 上监听 TCP 端口 %d，接收主机心跳。",
+                REDUNDANCY_NIC,
+                REDUNDANCY_HEARTBEAT_PORT,
+            )
+            return
+
+        logger.warning(
+            "[热冗余] 本机 %s 地址 %s 既不是配置的主机 %s 也不是备机 %s，"
+            "不启用热冗余（is_redundancy=False, is_master=False）。",
+            REDUNDANCY_NIC,
+            local_ip,
+            master_ip,
+            standby_ip,
+        )
+
+    def _shutdown_redundancy_heartbeat_threads(self) -> None:
+        self._heartbeat_stop.set()
+        for t in list(self._heartbeat_threads):
+            t.join(timeout=3)
+        self._heartbeat_threads.clear()
+
+    def _redundancy_master_tcp_heartbeat_loop(self) -> None:
+        """Connect to standby TCP port and send heartbeat payload once per second."""
+        local_ip = self._redundancy_local_ens35_ip
+        standby_ip = self._redundancy_standby_ip
+        if not local_ip or not standby_ip:
+            return
+        first_send_logged = False
+        while not self._heartbeat_stop.is_set():
+            sock: socket.socket | None = None
+            try:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                sock.bind((local_ip, 0))
+                sock.settimeout(10.0)
+                sock.connect((standby_ip, REDUNDANCY_HEARTBEAT_PORT))
+            except OSError as e:
+                logger.warning(
+                    "[热冗余][主机] 连接备机 TCP %s:%d 失败，将重试: %s",
+                    standby_ip,
+                    REDUNDANCY_HEARTBEAT_PORT,
+                    e,
+                )
+                if sock is not None:
+                    try:
+                        sock.close()
+                    except OSError:
+                        pass
+                if self._heartbeat_stop.wait(REDUNDANCY_MASTER_HEARTBEAT_INTERVAL_SEC):
+                    break
+                continue
+
+            try:
+                while not self._heartbeat_stop.is_set():
+                    try:
+                        sock.sendall(REDUNDANCY_HB_PAYLOAD)
+                    except OSError as e:
+                        logger.warning(
+                            "[热冗余][主机] 发送 TCP 心跳失败，将重连备机: %s",
+                            e,
+                        )
+                        break
+                    if not first_send_logged:
+                        logger.info(
+                            "[热冗余][主机] 第一次开始向备机发送 TCP 心跳包（备机=%s:%d，本机源地址=%s）。",
+                            standby_ip,
+                            REDUNDANCY_HEARTBEAT_PORT,
+                            local_ip,
+                        )
+                        first_send_logged = True
+                    if self._heartbeat_stop.wait(REDUNDANCY_MASTER_HEARTBEAT_INTERVAL_SEC):
+                        break
+            finally:
+                if sock is not None:
+                    try:
+                        sock.close()
+                    except OSError:
+                        pass
+        logger.info("[热冗余][主机] TCP 心跳发送线程已退出。")
+
+    def _redundancy_standby_tcp_heartbeat_loop(self) -> None:
+        """
+        Listen on ens35 for master TCP; recv timeout 1s increments lost_times if no packet;
+        valid heartbeat resets lost_times; log when lost_times > 5.
+        """
+        local_ip = self._redundancy_local_ens35_ip
+        if not local_ip:
+            return
+        server: socket.socket | None = None
+        try:
+            server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            server.bind((local_ip, REDUNDANCY_HEARTBEAT_PORT))
+            server.listen(1)
+            logger.info(
+                "[热冗余][备机] TCP 冗余心跳监听已建立：绑定地址=%s:%d，等待主机连入。",
+                local_ip,
+                REDUNDANCY_HEARTBEAT_PORT,
+            )
+            server.settimeout(1.0)
+            while not self._heartbeat_stop.is_set():
+                try:
+                    client, addr = server.accept()
+                except TimeoutError:
+                    continue
+                except OSError as e:
+                    if self._heartbeat_stop.is_set():
+                        break
+                    logger.error("[热冗余][备机] accept 失败: %s", e)
+                    continue
+                logger.info(
+                    "[热冗余][备机] 已接受主机 TCP 连接，对端=%s:%d。",
+                    addr[0],
+                    addr[1],
+                )
+                lost_times = 0
+                self._standby_hb_lost_logged = False
+                buf = b""
+                try:
+                    client.settimeout(REDUNDANCY_STANDBY_RECV_IDLE_SEC)
+                    while not self._heartbeat_stop.is_set():
+                        try:
+                            chunk = client.recv(4096)
+                        except (TimeoutError, socket.timeout):
+                            lost_times += 1
+                            if lost_times > 5:
+                                if not self._standby_hb_lost_logged:
+                                    logger.error(
+                                        "[热冗余][备机] 告警：已连续超过 5 次在 %.1f 秒内"
+                                        "未收到主机 TCP 心跳包（lost_times=%d），"
+                                        "判定主机可能异常或链路中断（本机备机=%s，网卡=%s）。",
+                                        REDUNDANCY_STANDBY_RECV_IDLE_SEC,
+                                        lost_times,
+                                        local_ip,
+                                        REDUNDANCY_NIC,
+                                    )
+                                    self._standby_hb_lost_logged = True
+                            continue
+                        except OSError as e:
+                            logger.warning("[热冗余][备机] 接收 TCP 数据错误: %s", e)
+                            break
+                        if not chunk:
+                            logger.info("[热冗余][备机] 主机已关闭 TCP 连接，返回等待新的连接。")
+                            break
+                        buf += chunk
+                        while True:
+                            idx = buf.find(REDUNDANCY_HB_PAYLOAD)
+                            if idx < 0:
+                                if len(buf) > 65536:
+                                    buf = buf[-4096:]
+                                break
+                            buf = buf[idx + len(REDUNDANCY_HB_PAYLOAD):]
+                            lost_times = 0
+                            if self._standby_hb_lost_logged:
+                                logger.info(
+                                    "[热冗余][备机] 已重新收到主机 TCP 心跳包，"
+                                    "lost_times 已清零。",
+                                )
+                            self._standby_hb_lost_logged = False
+                finally:
+                    try:
+                        client.close()
+                    except OSError:
+                        pass
+        finally:
+            if server is not None:
+                try:
+                    server.close()
+                except OSError:
+                    pass
+            logger.info("[热冗余][备机] TCP 心跳监听线程已退出。")
+
+    def _start_redundancy_heartbeat_threads(self) -> None:
+        self._shutdown_redundancy_heartbeat_threads()
+        # New cycle needs a clear stop event (previous stop() left it set).
+        self._heartbeat_stop = threading.Event()
+        self._standby_hb_lost_logged = False
+        if not self.is_redundancy:
+            return
+        if self.is_master:
+            t = threading.Thread(
+                target=self._redundancy_master_tcp_heartbeat_loop,
+                name="redundancy-master-tcp-hb",
+                daemon=True,
+            )
+            self._heartbeat_threads.append(t)
+            t.start()
+            return
+        t = threading.Thread(
+            target=self._redundancy_standby_tcp_heartbeat_loop,
+            name="redundancy-standby-tcp-hb",
+            daemon=True,
+        )
+        self._heartbeat_threads.append(t)
+        t.start()
 
     def find_running_process(self):
         """
@@ -110,6 +507,8 @@ class RuntimeManager:
             logger.warning("Runtime manager already running")
             return
 
+        self._evaluate_redundancy_role()
+
         self.running = True
 
         # Ensure UNIX socket paths exist
@@ -153,6 +552,8 @@ class RuntimeManager:
         if not self.monitor_thread.is_alive():
             self.monitor_thread = threading.Thread(target=self._monitor, daemon=True)
             self.monitor_thread.start()
+
+        self._start_redundancy_heartbeat_threads()
 
     def is_runtime_alive(self):
         """
@@ -233,6 +634,7 @@ class RuntimeManager:
         """ "
         Stop the runtime manager and the PLC runtime process
         """
+        self._shutdown_redundancy_heartbeat_threads()
         try:
             self.runtime_socket.send_message("STOP\n")
         except (OSError, socket.error) as e:
