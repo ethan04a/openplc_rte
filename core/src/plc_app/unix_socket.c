@@ -9,8 +9,11 @@
 #include <sys/un.h>
 #include <unistd.h>
 
+#include "../drivers/plugin_driver.h"
 #include "debug_handler.h"
+#include "image_snapshot.h"
 #include "plc_state_manager.h"
+#include "redundancy_ipc.h"
 #include "scan_cycle_manager.h"
 #include "unix_socket.h"
 #include "utils/log.h"
@@ -18,6 +21,7 @@
 
 extern volatile sig_atomic_t keep_running;
 extern PLCState plc_state;
+extern plugin_driver_t *plugin_driver;
 
 // helper: read one line terminated by '\n' from a socket
 static ssize_t read_line(int fd, char *buffer, size_t max_length)
@@ -39,6 +43,38 @@ static ssize_t read_line(int fd, char *buffer, size_t max_length)
     }
     buffer[total_read] = '\0'; // null-terminate the string
     return total_read;
+}
+
+static int read_exact(int fd, void *buf, size_t len)
+{
+    size_t off = 0;
+
+    while (off < len)
+    {
+        ssize_t r = read(fd, (char *)buf + off, len - off);
+        if (r <= 0)
+        {
+            return -1;
+        }
+        off += (size_t)r;
+    }
+    return 0;
+}
+
+static int write_all(int fd, const void *buf, size_t len)
+{
+    size_t off = 0;
+
+    while (off < len)
+    {
+        ssize_t w = write(fd, (const char *)buf + off, len - off);
+        if (w <= 0)
+        {
+            return -1;
+        }
+        off += (size_t)w;
+    }
+    return 0;
 }
 
 void handle_unix_socket_commands(const char *command, char *response, size_t response_size)
@@ -122,6 +158,10 @@ void handle_unix_socket_commands(const char *command, char *response, size_t res
             strncpy(response, "DEBUG:ERROR_PARSING\n", response_size);
         }
     }
+    else if (strcmp(command, "REDUNDANCY_SHADOW_EXIT") == 0)
+    {
+        redundancy_shadow_exit_response(response, response_size);
+    }
     else
     {
         log_error("Unknown command received: %s", command);
@@ -175,15 +215,112 @@ void *unix_socket_thread(void *arg)
             ssize_t bytes_read = read_line(client_fd, command_buffer, COMMAND_BUFFER_SIZE);
             if (bytes_read > 0)
             {
-                // Handle the command
                 char response[MAX_RESPONSE_SIZE] = {0};
-                handle_unix_socket_commands(command_buffer, response, MAX_RESPONSE_SIZE);
-                if (strlen(response) > 0)
+
+                if (strcmp(command_buffer, "IMAGE_SNAPSHOT_GET") == 0)
                 {
-                    ssize_t bytes_written = write(client_fd, response, strlen(response));
-                    if (bytes_written <= 0)
+                    if (!plugin_driver)
                     {
-                        log_error("Error writing on unix socket: %s", strerror(errno));
+                        strncpy(response, "IMAGE_SNAPSHOT_GET:NO_DRIVER\n", MAX_RESPONSE_SIZE);
+                        write_all(client_fd, response, strlen(response));
+                    }
+                    else
+                    {
+                        uint8_t *payload = malloc(IMAGE_SNAPSHOT_TOTAL_BYTES);
+                        if (!payload)
+                        {
+                            strncpy(response, "IMAGE_SNAPSHOT_GET:ALLOC\n", MAX_RESPONSE_SIZE);
+                            write_all(client_fd, response, strlen(response));
+                        }
+                        else
+                        {
+                            size_t out_len = 0;
+                            int exp_err;
+
+                            plugin_mutex_take(&plugin_driver->buffer_mutex);
+                            exp_err =
+                                image_snapshot_export(payload, IMAGE_SNAPSHOT_TOTAL_BYTES, &out_len);
+                            plugin_mutex_give(&plugin_driver->buffer_mutex);
+
+                            if (exp_err != 0 || out_len != IMAGE_SNAPSHOT_TOTAL_BYTES)
+                            {
+                                free(payload);
+                                strncpy(response, "IMAGE_SNAPSHOT_GET:EXPORT_ERROR\n",
+                                         MAX_RESPONSE_SIZE);
+                                write_all(client_fd, response, strlen(response));
+                            }
+                            else
+                            {
+                                char hdr[96];
+                                snprintf(hdr, sizeof(hdr), "IMAGE_SNAPSHOT_HDR:%d:%zu\n",
+                                         IMAGE_SNAPSHOT_VERSION, out_len);
+                                if (write_all(client_fd, hdr, strlen(hdr)) != 0 ||
+                                    write_all(client_fd, payload, out_len) != 0)
+                                {
+                                    log_error("IMAGE_SNAPSHOT_GET: write failed");
+                                }
+                                free(payload);
+                            }
+                        }
+                    }
+                }
+                else if (strncmp(command_buffer, "IMAGE_SNAPSHOT_SET:", 19) == 0)
+                {
+                    unsigned ver = 0;
+                    unsigned long sz = 0;
+
+                    if (sscanf(command_buffer + 19, "%u:%lu", &ver, &sz) != 2 || !plugin_driver)
+                    {
+                        strncpy(response, "IMAGE_SNAPSHOT_SET:HDR_ERROR\n", MAX_RESPONSE_SIZE);
+                        write_all(client_fd, response, strlen(response));
+                    }
+                    else if (ver != IMAGE_SNAPSHOT_VERSION || sz != IMAGE_SNAPSHOT_TOTAL_BYTES)
+                    {
+                        strncpy(response, "IMAGE_SNAPSHOT_SET:VERSION_OR_SIZE\n",
+                                MAX_RESPONSE_SIZE);
+                        write_all(client_fd, response, strlen(response));
+                    }
+                    else
+                    {
+                        uint8_t *payload = malloc(sz);
+                        if (!payload || read_exact(client_fd, payload, (size_t)sz) != 0)
+                        {
+                            free(payload);
+                            strncpy(response, "IMAGE_SNAPSHOT_SET:READ_ERROR\n", MAX_RESPONSE_SIZE);
+                            write_all(client_fd, response, strlen(response));
+                        }
+                        else
+                        {
+                            int imp_err;
+
+                            plugin_mutex_take(&plugin_driver->buffer_mutex);
+                            imp_err = image_snapshot_import(payload, (size_t)sz);
+                            plugin_mutex_give(&plugin_driver->buffer_mutex);
+                            free(payload);
+
+                            if (imp_err != 0)
+                            {
+                                strncpy(response, "IMAGE_SNAPSHOT_SET:IMPORT_ERROR\n",
+                                        MAX_RESPONSE_SIZE);
+                            }
+                            else
+                            {
+                                strncpy(response, "IMAGE_SNAPSHOT_SET:OK\n", MAX_RESPONSE_SIZE);
+                            }
+                            write_all(client_fd, response, strlen(response));
+                        }
+                    }
+                }
+                else
+                {
+                    handle_unix_socket_commands(command_buffer, response, MAX_RESPONSE_SIZE);
+                    if (strlen(response) > 0)
+                    {
+                        ssize_t bytes_written = write(client_fd, response, strlen(response));
+                        if (bytes_written <= 0)
+                        {
+                            log_error("Error writing on unix socket: %s", strerror(errno));
+                        }
                     }
                 }
             }

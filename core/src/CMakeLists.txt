@@ -63,6 +63,8 @@ add_executable(plc_main
     ${CMAKE_SOURCE_DIR}/core/src/plc_app/utils/utils.c
     ${CMAKE_SOURCE_DIR}/core/src/plc_app/utils/watchdog.c
     ${CMAKE_SOURCE_DIR}/core/src/plc_app/image_tables.c
+    ${CMAKE_SOURCE_DIR}/core/src/plc_app/image_snapshot.c
+    ${CMAKE_SOURCE_DIR}/core/src/plc_app/redundancy_ipc.c
     ${CMAKE_SOURCE_DIR}/core/src/plc_app/journal_buffer.c
     ${CMAKE_SOURCE_DIR}/core/src/plc_app/plc_state_manager.c
     ${CMAKE_SOURCE_DIR}/core/src/plc_app/plcapp_manager.c

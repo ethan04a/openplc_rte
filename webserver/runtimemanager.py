@@ -1,6 +1,7 @@
 import ipaddress
 import os
 import socket
+import struct
 import subprocess
 import threading
 import time
@@ -16,7 +17,11 @@ except ImportError:
     HAS_PSUTIL = False
 
 from webserver.logger import get_logger
-from webserver.unixclient import SyncUnixClient
+from webserver.unixclient import (
+    IMAGE_SNAPSHOT_EXPECTED_BYTES,
+    IMAGE_SNAPSHOT_PROTOCOL_VERSION,
+    SyncUnixClient,
+)
 from webserver.unixserver import UnixLogServer
 
 logger, buffer = get_logger("logger", use_buffer=True)
@@ -33,6 +38,8 @@ RAPID_CRASH_WINDOW = 30  # seconds
 REDUNDANCY_ROLE_FILENAME = "redundancy_role.ini"
 REDUNDANCY_NIC = "ens35"
 REDUNDANCY_HEARTBEAT_PORT = 57575
+REDUNDANCY_IMAGE_SYNC_PORT = 57576
+REDUNDANCY_IMAGE_MAGIC = b"OPIM"
 REDUNDANCY_HB_PAYLOAD = b"OPENPLC_REDUNDANCY_HB_V1\n"
 REDUNDANCY_MASTER_HEARTBEAT_INTERVAL_SEC = 1.0
 REDUNDANCY_STANDBY_RECV_IDLE_SEC = 1.0
@@ -41,6 +48,25 @@ REDUNDANCY_STANDBY_LOST_THRESHOLD_SEC = 5
 # Functional I/O NICs (lines 3–4 of redundancy_role.ini record host IPv4/prefix)
 REDUNDANCY_FUNCTIONAL_NIC_A = "ens33"
 REDUNDANCY_FUNCTIONAL_NIC_B = "ens34"
+
+
+def _tcp_recv_exact(conn: socket.socket, n: int, timeout: float | None) -> bytes | None:
+    """Read exactly n bytes from TCP stream."""
+    if n <= 0:
+        return b""
+    conn.settimeout(timeout)
+    chunks: list[bytes] = []
+    remaining = n
+    while remaining > 0:
+        try:
+            chunk = conn.recv(remaining)
+        except (TimeoutError, socket.timeout, OSError):
+            return None
+        if not chunk:
+            return None
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
 
 
 class RuntimeManager:
@@ -530,10 +556,30 @@ class RuntimeManager:
 
         self._shutdown_redundancy_heartbeat_threads()
         try:
-            self._restart_plc_core_after_takeover()
+            if self._try_redundancy_shadow_exit():
+                logger.info(
+                    "[热冗余][备机] 已通过 REDUNDANCY_SHADOW_EXIT 平滑升主（保留 PLC 进程与 I/O 镜像）"
+                )
+            else:
+                self._restart_plc_core_after_takeover()
         except Exception as e:
-            logger.error("[热冗余][备机] 升主后重启 PLC 核心失败: %s", e)
+            logger.error("[热冗余][备机] 升主后切换 PLC 核心失败: %s", e)
         self._start_redundancy_heartbeat_threads()
+
+    def _try_redundancy_shadow_exit(self) -> bool:
+        """Try to enable field I/O in-process without restarting plc_main."""
+        try:
+            self._safe_connect_runtime_socket()
+            if not self.runtime_socket.is_connected():
+                return False
+            resp = self.runtime_socket.send_and_receive(
+                "REDUNDANCY_SHADOW_EXIT\n",
+                timeout=120.0,
+            )
+            return resp == "REDUNDANCY_SHADOW_EXIT:OK"
+        except (OSError, RuntimeError, TypeError, ValueError) as e:
+            logger.warning("[热冗余][备机] REDUNDANCY_SHADOW_EXIT 不可用或失败，将回退为重启 plc_main: %s", e)
+            return False
 
     def _redundancy_trigger_failback_to_standby(self) -> None:
         """收到原主机冗余心跳后回切：按 ini 第 5–6 行恢复 ens33/ens34，影子 PLC。"""
@@ -902,6 +948,150 @@ class RuntimeManager:
                     pass
             logger.info("[热冗余][备机] TCP 心跳监听线程已退出。")
 
+    def _redundancy_image_sync_master_loop(self) -> None:
+        """Push I/O snapshots to standby over TCP (redundancy NIC)."""
+        standby_ip = self._redundancy_standby_ip
+        if not standby_ip:
+            logger.warning("[热冗余][主机] 未配置备机冗余 IP，跳过 I/O 镜像同步发送")
+            return
+
+        sock: socket.socket | None = None
+        logger.info(
+            "[热冗余][主机] I/O 镜像同步发送线程启动 → %s:%s",
+            standby_ip,
+            REDUNDANCY_IMAGE_SYNC_PORT,
+        )
+        try:
+            while not self._heartbeat_stop.is_set():
+                if not self.is_master:
+                    break
+                try:
+                    if sock is None:
+                        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                        sock.settimeout(5.0)
+                        sock.connect((standby_ip, REDUNDANCY_IMAGE_SYNC_PORT))
+                        sock.settimeout(30.0)
+
+                    payload = self.runtime_socket.image_snapshot_get()
+                    if (
+                        not payload
+                        or len(payload) != IMAGE_SNAPSHOT_EXPECTED_BYTES
+                    ):
+                        time.sleep(0.05)
+                        continue
+
+                    header = struct.pack(
+                        "!4sII",
+                        REDUNDANCY_IMAGE_MAGIC,
+                        IMAGE_SNAPSHOT_PROTOCOL_VERSION,
+                        len(payload),
+                    )
+                    sock.sendall(header + payload)
+                    time.sleep(0.02)
+                except OSError as e:
+                    logger.debug("[热冗余][主机] I/O 同步 TCP 异常（将重连）: %s", e)
+                    if sock is not None:
+                        try:
+                            sock.close()
+                        except OSError:
+                            pass
+                        sock = None
+                    time.sleep(0.5)
+                except (RuntimeError, TypeError, ValueError) as e:
+                    logger.warning("[热冗余][主机] I/O 同步异常: %s", e)
+                    time.sleep(0.5)
+        finally:
+            if sock is not None:
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+            logger.info("[热冗余][主机] I/O 镜像同步发送线程已退出。")
+
+    def _redundancy_image_sync_standby_loop(self) -> None:
+        """Receive I/O snapshots from master and apply via Unix socket."""
+        local_ip = self._redundancy_local_ens35_ip
+        master_ip = self._redundancy_master_ip
+        if not local_ip or not master_ip:
+            logger.warning("[热冗余][备机] 冗余 IP 未就绪，跳过 I/O 镜像监听")
+            return
+
+        server: socket.socket | None = None
+        try:
+            server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            server.bind((local_ip, REDUNDANCY_IMAGE_SYNC_PORT))
+            server.listen(2)
+            logger.info(
+                "[热冗余][备机] I/O 镜像监听 %s:%s（仅接受主机 %s）",
+                local_ip,
+                REDUNDANCY_IMAGE_SYNC_PORT,
+                master_ip,
+            )
+            server.settimeout(1.0)
+            while not self._heartbeat_stop.is_set():
+                if self._promoted_standby_acting_master:
+                    time.sleep(0.2)
+                    continue
+                try:
+                    conn, addr = server.accept()
+                except TimeoutError:
+                    continue
+                except OSError as e:
+                    if self._heartbeat_stop.is_set():
+                        break
+                    logger.error("[热冗余][备机] I/O 镜像 accept 失败: %s", e)
+                    continue
+
+                if addr[0] != master_ip:
+                    logger.warning(
+                        "[热冗余][备机] I/O 镜像拒绝非主机连接 %s",
+                        addr[0],
+                    )
+                    try:
+                        conn.close()
+                    except OSError:
+                        pass
+                    continue
+
+                conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                try:
+                    while (
+                        not self._heartbeat_stop.is_set()
+                        and not self._promoted_standby_acting_master
+                    ):
+                        hdr = _tcp_recv_exact(conn, 12, 30.0)
+                        if hdr is None or len(hdr) != 12:
+                            break
+                        magic, ver, ln = struct.unpack("!4sII", hdr)
+                        if magic != REDUNDANCY_IMAGE_MAGIC:
+                            break
+                        if ver != IMAGE_SNAPSHOT_PROTOCOL_VERSION:
+                            break
+                        if ln != IMAGE_SNAPSHOT_EXPECTED_BYTES:
+                            break
+                        body = _tcp_recv_exact(conn, ln, 30.0)
+                        if body is None or len(body) != ln:
+                            break
+                        try:
+                            self.runtime_socket.image_snapshot_set(body)
+                        except (OSError, RuntimeError) as e:
+                            logger.warning("[热冗余][备机] I/O 镜像 SET 失败: %s", e)
+                            break
+                finally:
+                    try:
+                        conn.close()
+                    except OSError:
+                        pass
+        finally:
+            if server is not None:
+                try:
+                    server.close()
+                except OSError:
+                    pass
+            logger.info("[热冗余][备机] I/O 镜像监听线程已退出。")
+
     def _start_redundancy_heartbeat_threads(self) -> None:
         self._shutdown_redundancy_heartbeat_threads()
         # New cycle needs a clear stop event (previous stop() left it set).
@@ -916,6 +1106,13 @@ class RuntimeManager:
             )
             self._heartbeat_threads.append(t)
             t.start()
+            t_img = threading.Thread(
+                target=self._redundancy_image_sync_master_loop,
+                name="redundancy-master-io-sync",
+                daemon=True,
+            )
+            self._heartbeat_threads.append(t_img)
+            t_img.start()
             return
         t = threading.Thread(
             target=self._redundancy_standby_tcp_heartbeat_loop,
@@ -924,6 +1121,13 @@ class RuntimeManager:
         )
         self._heartbeat_threads.append(t)
         t.start()
+        t_img = threading.Thread(
+            target=self._redundancy_image_sync_standby_loop,
+            name="redundancy-standby-io-sync",
+            daemon=True,
+        )
+        self._heartbeat_threads.append(t_img)
+        t_img.start()
 
     def find_running_process(self):
         """
