@@ -6,7 +6,6 @@ Standby receives via /api/redundancy/receive-program (shared secret header).
 from __future__ import annotations
 
 import ipaddress
-import os
 import threading
 import time
 from pathlib import Path
@@ -21,22 +20,21 @@ from webserver.plcapp_management import (
     build_state,
 )
 from webserver.restapi import restapi_bp
-from webserver.runtimemanager import REDUNDANCY_ROLE_FILENAME, RuntimeManager
+from webserver.runtimemanager import (
+    REDUNDANCY_ROLE_FILENAME,
+    REDUNDANCY_SYNC_SECRET,
+    RuntimeManager,
+)
 
 logger, _ = get_logger("runtime", use_buffer=True)
 
-REDUNDANCY_SYNC_SECRET_ENV = "OPENPLC_REDUNDANCY_SYNC_SECRET"
-
 
 def register_redundancy_sync_routes(runtime_manager: RuntimeManager) -> None:
-    """Add unauthenticated peer sync endpoint (protected by OPENPLC_REDUNDANCY_SYNC_SECRET)."""
+    """Add unauthenticated peer sync endpoint (protected by REDUNDANCY_SYNC_SECRET)."""
 
     @restapi_bp.route("/redundancy/receive-program", methods=["POST"])
     def redundancy_receive_program():
-        expected = os.environ.get(REDUNDANCY_SYNC_SECRET_ENV, "").strip()
-        if not expected:
-            return jsonify({"error": "redundancy sync disabled"}), 503
-        if request.headers.get("X-OpenPLC-Redundancy-Sync") != expected:
+        if request.headers.get("X-OpenPLC-Redundancy-Sync") != REDUNDANCY_SYNC_SECRET:
             return jsonify({"error": "forbidden"}), 403
         if build_state.status == BuildStatus.COMPILING:
             return (
@@ -70,10 +68,7 @@ def register_redundancy_sync_routes(runtime_manager: RuntimeManager) -> None:
 
     @restapi_bp.route("/redundancy/sync-role-ini", methods=["POST"])
     def redundancy_sync_role_ini():
-        expected = os.environ.get(REDUNDANCY_SYNC_SECRET_ENV, "").strip()
-        if not expected:
-            return jsonify({"error": "redundancy sync disabled"}), 503
-        if request.headers.get("X-OpenPLC-Redundancy-Sync") != expected:
+        if request.headers.get("X-OpenPLC-Redundancy-Sync") != REDUNDANCY_SYNC_SECRET:
             return jsonify({"error": "forbidden"}), 403
         data = request.get_json(silent=True) or {}
         line3 = str(data.get("line3", "")).strip()
@@ -161,14 +156,6 @@ def schedule_master_to_standby_sync(runtime_manager: RuntimeManager) -> None:
     ):
         return
 
-    secret = os.environ.get(REDUNDANCY_SYNC_SECRET_ENV, "").strip()
-    if not secret:
-        logger.warning(
-            "[热冗余] 未设置环境变量 %s，跳过向备机同步程序（两端需配置相同密钥）",
-            REDUNDANCY_SYNC_SECRET_ENV,
-        )
-        return
-
     standby_ip = runtime_manager._redundancy_standby_ip
 
     def worker() -> None:
@@ -178,7 +165,9 @@ def schedule_master_to_standby_sync(runtime_manager: RuntimeManager) -> None:
             logger.error("[热冗余] 找不到 %s，无法同步到备机", LAST_UPLOADED_PROGRAM_ZIP)
             return
         try:
-            push_program_zip_to_standby(standby_ip, LAST_UPLOADED_PROGRAM_ZIP, secret)
+            push_program_zip_to_standby(
+                standby_ip, LAST_UPLOADED_PROGRAM_ZIP, REDUNDANCY_SYNC_SECRET
+            )
         except Exception as e:
             logger.error("[热冗余] 向备机推送程序异常: %s", e)
 

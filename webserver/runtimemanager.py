@@ -40,6 +40,8 @@ REDUNDANCY_NIC = "ens35"
 REDUNDANCY_HEARTBEAT_PORT = 57575
 REDUNDANCY_IMAGE_SYNC_PORT = 57576
 REDUNDANCY_IMAGE_MAGIC = b"OPIM"
+# Hot redundancy: HTTP peer sync (receive-program / sync-role-ini header X-OpenPLC-Redundancy-Sync)
+REDUNDANCY_SYNC_SECRET = "openplc"
 REDUNDANCY_HB_PAYLOAD = b"OPENPLC_REDUNDANCY_HB_V1\n"
 REDUNDANCY_MASTER_HEARTBEAT_INTERVAL_SEC = 1.0
 REDUNDANCY_STANDBY_RECV_IDLE_SEC = 1.0
@@ -367,16 +369,13 @@ class RuntimeManager:
                 REDUNDANCY_FUNCTIONAL_NIC_B,
                 c34,
             )
-            secret = os.environ.get("OPENPLC_REDUNDANCY_SYNC_SECRET", "").strip()
             standby_ip = self._redundancy_standby_ip
-            if not secret or not standby_ip:
-                logger.warning(
-                    "[热冗余] 未设置 OPENPLC_REDUNDANCY_SYNC_SECRET 或备机 IP，跳过同步 redundancy_role.ini"
-                )
+            if not standby_ip:
+                logger.warning("[热冗余] 未配置备机 IP，跳过同步 redundancy_role.ini")
                 return
             from webserver.redundancy_program_sync import push_role_ini_functional_to_standby
 
-            push_role_ini_functional_to_standby(standby_ip, c33, c34, secret)
+            push_role_ini_functional_to_standby(standby_ip, c33, c34, REDUNDANCY_SYNC_SECRET)
         except Exception as e:
             logger.error("[热冗余] 功能 IP 记录/同步异常: %s", e)
 
