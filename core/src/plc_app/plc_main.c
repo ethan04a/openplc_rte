@@ -35,8 +35,10 @@ void handle_sigint(int sig)
 
 int main(int argc, char *argv[])
 {
-    bool print_debug = false;
-    bool safe_mode   = false;
+    bool print_debug      = false;
+    bool safe_mode        = false;
+    bool shadow_standby   = false;
+    const char *shadow_ev = getenv("OPENPLC_SHADOW_STANDBY");
 
     // Check for command line arguments
     for (int i = 1; i < argc; i++)
@@ -53,6 +55,15 @@ int main(int argc, char *argv[])
         {
             safe_mode = true;
         }
+        else if (strcmp(argv[i], "--shadow-standby") == 0)
+        {
+            shadow_standby = true;
+        }
+    }
+
+    if (!shadow_standby && shadow_ev != NULL && strcmp(shadow_ev, "1") == 0)
+    {
+        shadow_standby = true;
     }
 
     // Initialize logging system
@@ -105,6 +116,11 @@ int main(int argc, char *argv[])
     if (plugin_driver)
     {
         log_info("[PLUGIN]: Plugin driver system created");
+        if (shadow_standby)
+        {
+            plugin_driver_set_shadow_standby(plugin_driver, 1);
+            log_info("[PLUGIN]: Shadow standby mode active — PLC logic runs without field I/O plugins");
+        }
         if (plugin_driver_load_config(plugin_driver, "./plugins.conf") == 0)
         {
             plugin_driver_init(plugin_driver);

@@ -96,6 +96,15 @@ plugin_driver_t *plugin_driver_create(void)
     return driver;
 }
 
+void plugin_driver_set_shadow_standby(plugin_driver_t *driver, int enabled)
+{
+    if (!driver)
+    {
+        return;
+    }
+    driver->shadow_standby = enabled ? 1 : 0;
+}
+
 // Mutex helper functions for plugins
 int plugin_mutex_take(pthread_mutex_t *mutex)
 {
@@ -175,6 +184,14 @@ int plugin_driver_update_config(plugin_driver_t *driver, const char *config_file
     if (!driver || !config_file)
     {
         return -1;
+    }
+
+    if (driver->shadow_standby)
+    {
+        log_info("[PLUGIN]: Shadow standby — omitting field I/O plugin configuration load");
+        driver->plugin_count = 0;
+        has_python_plugin    = 0;
+        return 0;
     }
 
     // Check if config file exists, if not copy from default
@@ -277,6 +294,12 @@ int plugin_driver_init(plugin_driver_t *driver)
     if (!driver)
     {
         return -1;
+    }
+
+    if (driver->shadow_standby)
+    {
+        log_info("[PLUGIN]: Shadow standby — skipping plugin init (no field I/O)");
+        return 0;
     }
 
     // Only acquire Python GIL if we have Python plugins and Python is initialized
@@ -384,6 +407,12 @@ int plugin_driver_start(plugin_driver_t *driver)
     if (!driver)
     {
         return -1;
+    }
+
+    if (driver->shadow_standby)
+    {
+        log_info("[PLUGIN]: Shadow standby — skipping plugin start (no field I/O)");
+        return 0;
     }
 
     if (driver->plugin_count == 0)
@@ -1018,7 +1047,7 @@ void python_plugin_cycle(plugin_instance_t *plugin)
 // Plugins opt-in by implementing cycle_start(); opt-out by not implementing it (NULL pointer)
 void plugin_driver_cycle_start(plugin_driver_t *driver)
 {
-    if (!driver || driver->plugin_count == 0)
+    if (!driver || driver->shadow_standby || driver->plugin_count == 0)
     {
         return;
     }
@@ -1047,7 +1076,7 @@ void plugin_driver_cycle_start(plugin_driver_t *driver)
 // Plugins opt-in by implementing cycle_end(); opt-out by not implementing it (NULL pointer)
 void plugin_driver_cycle_end(plugin_driver_t *driver)
 {
-    if (!driver || driver->plugin_count == 0)
+    if (!driver || driver->shadow_standby || driver->plugin_count == 0)
     {
         return;
     }

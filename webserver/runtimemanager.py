@@ -65,6 +65,8 @@ class RuntimeManager:
         self._heartbeat_threads: list[threading.Thread] = []
         # Standby: True after 备升主切换占位触发；为 True 时不累计 LostTimes、不解析心跳，仅等待主机 TCP 以回切
         self._standby_switched_to_master = False
+        # True → plc_main 以影子备机运行（无现场 I/O 插件，仅冗余心跳由 Python 侧处理）
+        self._plc_shadow_standby = False
 
     @staticmethod
     def _openplc_project_root() -> Path:
@@ -178,6 +180,7 @@ class RuntimeManager:
         self._redundancy_master_ip = None
         self._redundancy_standby_ip = None
         self._redundancy_local_ens35_ip = None
+        self._plc_shadow_standby = False
 
         project_root = self._openplc_project_root()
         ini_path = project_root / REDUNDANCY_ROLE_FILENAME
@@ -244,6 +247,7 @@ class RuntimeManager:
         if local_ip == standby_ip:
             self.is_redundancy = True
             self.is_master = False
+            self._plc_shadow_standby = not self._standby_switched_to_master
             logger.info(
                 "[热冗余] 本机 IPv4 与配置中的备机一致，角色=备机。"
                 "is_redundancy=True, is_master=False。"
@@ -251,6 +255,11 @@ class RuntimeManager:
                 REDUNDANCY_NIC,
                 REDUNDANCY_HEARTBEAT_PORT,
             )
+            if self._plc_shadow_standby:
+                logger.info(
+                    "[热冗余] 备机将使用 plc_main --shadow-standby：运行相同 PLC 逻辑，"
+                    "不加载现场 I/O 插件（仅与主机冗余通信由 Web 层负责）。"
+                )
             return
 
         logger.warning(
@@ -617,6 +626,8 @@ class RuntimeManager:
                 cmd = [self.runtime_path]
                 if self.print_debug:
                     cmd.append("--print-debug")
+                if self._plc_shadow_standby:
+                    cmd.append("--shadow-standby")
                 self.process = subprocess.Popen(cmd)
             except (OSError, subprocess.SubprocessError) as e:
                 logger.error("Failed to start PLC runtime process: %s", e)
@@ -654,6 +665,8 @@ class RuntimeManager:
                 cmd.append("--print-debug")
             if safe_mode:
                 cmd.append("--safe-mode")
+            elif self._plc_shadow_standby:
+                cmd.append("--shadow-standby")
             self.process = subprocess.Popen(cmd)
         except (OSError, subprocess.SubprocessError) as e:
             logger.error("Failed to start PLC runtime process: %s", e)

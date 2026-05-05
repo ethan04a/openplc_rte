@@ -50,10 +50,13 @@ typedef struct
     plugin_instance_t plugins[MAX_PLUGINS];
     int plugin_count;
     pthread_mutex_t buffer_mutex;
+    /** When non-zero: redundancy standby shadow mode — no field I/O plugins loaded or started. */
+    int shadow_standby;
 } plugin_driver_t;
 
 // Driver management functions
 plugin_driver_t *plugin_driver_create(void);
+void plugin_driver_set_shadow_standby(plugin_driver_t *driver, int enabled);
 int plugin_driver_load_config(plugin_driver_t *driver, const char *config_file);
 int plugin_driver_update_config(plugin_driver_t *driver, const char *config_file);
 int plugin_driver_init(plugin_driver_t *driver);

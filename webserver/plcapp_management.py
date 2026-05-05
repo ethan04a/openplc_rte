@@ -1,10 +1,13 @@
 from dataclasses import dataclass, field
 from enum import Enum, auto
+import glob
+import io
 import os
-import zipfile
+import shutil
 import subprocess
 import threading
-import glob
+import zipfile
+from pathlib import Path
 from typing import Final
 
 from webserver.runtimemanager import RuntimeManager
@@ -13,6 +16,8 @@ from webserver.plugin_config_model import PluginsConfiguration, PluginConfig
 
 logger, _ = get_logger("runtime", use_buffer=True)
 
+OPENPLC_ROOT: Final[Path] = Path(__file__).resolve().parent.parent
+LAST_UPLOADED_PROGRAM_ZIP: Final[Path] = OPENPLC_ROOT / "last_uploaded_program.zip"
 
 MAX_FILE_SIZE: Final[int] = 10 * 1024 * 1024   # 10 MB per file
 MAX_TOTAL_SIZE: Final[int] = 50 * 1024 * 1024  # 50 MB total
@@ -47,6 +52,9 @@ build_state = BuildProcess()  # global-ish singleton for status
 def analyze_zip(zip_path) -> tuple[bool, list]:
     """Analyze the ZIP file for safety before extraction."""
     build_state.status = BuildStatus.UNZIPPING
+
+    if hasattr(zip_path, "seek"):
+        zip_path.seek(0)
 
     if not zipfile.is_zipfile(zip_path):
         build_state.log("[ERROR] Not a valid PLC Program file.\n")
@@ -109,6 +117,9 @@ def safe_extract(zip_path, dest_dir, valid_files):
     - Auto-strips a single common root folder if present
     """
     build_state.status = BuildStatus.UNZIPPING
+
+    if hasattr(zip_path, "seek"):
+        zip_path.seek(0)
 
     with zipfile.ZipFile(zip_path, "r") as zf:
         # Detect roots (ignoring macOS junk)
@@ -295,5 +306,73 @@ def run_compile(runtime_manager: RuntimeManager, cwd: str = "core/generated"):
     if build_state.status == BuildStatus.SUCCESS:
         runtime_manager.reset_crash_tracking()
         runtime_manager.start_plc()
+        try:
+            from webserver.redundancy_program_sync import schedule_master_to_standby_sync
+
+            schedule_master_to_standby_sync(runtime_manager)
+        except Exception as e:
+            logger.error("[热冗余] 无法排程备机程序同步: %s", e)
     else:
         build_state.log("[WARNING] PLC program has not been updated because the build failed\n")
+
+
+def apply_program_zip_upload(runtime_manager: RuntimeManager, zip_bytes: bytes) -> dict:
+    """
+    Validate ZIP bytes, extract to core/generated, update plugins conf, start compile thread.
+    Caller must clear build_state / gate on COMPILING as appropriate.
+    """
+    if len(zip_bytes) > MAX_FILE_SIZE:
+        build_state.status = BuildStatus.FAILED
+        return {
+            "UploadFileFail": "File is too large",
+            "CompilationStatus": build_state.status.name,
+        }
+
+    try:
+        LAST_UPLOADED_PROGRAM_ZIP.parent.mkdir(parents=True, exist_ok=True)
+        LAST_UPLOADED_PROGRAM_ZIP.write_bytes(zip_bytes)
+
+        bio = io.BytesIO(zip_bytes)
+        safe, valid_files = analyze_zip(bio)
+        if not safe:
+            build_state.status = BuildStatus.FAILED
+            return {
+                "UploadFileFail": "Uploaded ZIP file failed safety checks",
+                "CompilationStatus": build_state.status.name,
+            }
+
+        extract_dir = "core/generated"
+        if os.path.exists(extract_dir):
+            shutil.rmtree(extract_dir)
+
+        bio.seek(0)
+        safe_extract(bio, extract_dir, valid_files)
+
+        update_plugin_configurations(extract_dir)
+
+        build_state.status = BuildStatus.COMPILING
+
+        task_compile = threading.Thread(
+            target=run_compile,
+            args=(runtime_manager,),
+            kwargs={"cwd": extract_dir},
+            daemon=True,
+        )
+        task_compile.start()
+
+        return {"UploadFileFail": "", "CompilationStatus": build_state.status.name}
+
+    except (OSError, IOError) as e:
+        build_state.status = BuildStatus.FAILED
+        build_state.log(f"[ERROR] File system error: {e}")
+        return {
+            "UploadFileFail": f"File system error: {e}",
+            "CompilationStatus": build_state.status.name,
+        }
+    except Exception as e:
+        build_state.status = BuildStatus.FAILED
+        build_state.log(f"[ERROR] Unexpected error: {e}")
+        return {
+            "UploadFileFail": f"Unexpected error: {e}",
+            "CompilationStatus": build_state.status.name,
+        }

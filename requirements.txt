@@ -4,6 +4,7 @@ Flask-JWT-Extended>=4.6.0
 flask_sqlalchemy
 Flask-SocketIO
 PyJWT
+requests>=2.28.0
 python-dotenv
 pytest
 pytest-flask

@@ -12,7 +12,6 @@ import errno
 import json
 import os
 import platform
-import shutil
 import ssl
 import threading
 from pathlib import Path
@@ -27,11 +26,8 @@ from webserver.logger import get_logger
 from webserver.plcapp_management import (
     MAX_FILE_SIZE,
     BuildStatus,
-    analyze_zip,
+    apply_program_zip_upload,
     build_state,
-    run_compile,
-    safe_extract,
-    update_plugin_configurations,
 )
 from webserver.restapi import (
     app_restapi,
@@ -211,61 +207,16 @@ def handle_upload_file(data: dict) -> dict:
         }
 
     zip_file = flask.request.files["file"]
-
-    if zip_file.content_length > MAX_FILE_SIZE:
+    zip_bytes = zip_file.read()
+    clen = getattr(zip_file, "content_length", None)
+    if (clen is not None and clen > MAX_FILE_SIZE) or len(zip_bytes) > MAX_FILE_SIZE:
         build_state.status = BuildStatus.FAILED
         return {
             "UploadFileFail": "File is too large",
             "CompilationStatus": build_state.status.name,
         }
 
-    try:
-        build_state.status = BuildStatus.UNZIPPING
-        safe, valid_files = analyze_zip(zip_file)
-        if not safe:
-            build_state.status = BuildStatus.FAILED
-            return {
-                "UploadFileFail": "Uploaded ZIP file failed safety checks",
-                "CompilationStatus": build_state.status.name,
-            }
-
-        extract_dir = "core/generated"
-        if os.path.exists(extract_dir):
-            shutil.rmtree(extract_dir)
-
-        safe_extract(zip_file, extract_dir, valid_files)
-
-        # Update plugin configurations based on extracted config files
-        update_plugin_configurations(extract_dir)
-
-        # Start compilation in a separate thread
-        build_state.status = BuildStatus.COMPILING
-
-        task_compile = threading.Thread(
-            target=run_compile,
-            args=(runtime_manager,),
-            kwargs={"cwd": extract_dir},
-            daemon=True,
-        )
-
-        task_compile.start()
-
-        return {"UploadFileFail": "", "CompilationStatus": build_state.status.name}
-
-    except (OSError, IOError) as e:
-        build_state.status = BuildStatus.FAILED
-        build_state.log(f"[ERROR] File system error: {e}")
-        return {
-            "UploadFileFail": f"File system error: {e}",
-            "CompilationStatus": build_state.status.name,
-        }
-    except Exception as e:
-        build_state.status = BuildStatus.FAILED
-        build_state.log(f"[ERROR] Unexpected error: {e}")
-        return {
-            "UploadFileFail": f"Unexpected error: {e}",
-            "CompilationStatus": build_state.status.name,
-        }
+    return apply_program_zip_upload(runtime_manager, zip_bytes)
 
 
 POST_HANDLERS: dict[str, Callable[[dict], dict]] = {
@@ -288,6 +239,9 @@ def restapi_callback_post(argument: str, data: dict) -> dict:
 
 def run_https():
     # rest api register
+    from webserver.redundancy_program_sync import register_redundancy_sync_routes
+
+    register_redundancy_sync_routes(runtime_manager)
     app_restapi.register_blueprint(restapi_bp, url_prefix="/api")
     register_callback_get(restapi_callback_get)
     register_callback_post(restapi_callback_post)
