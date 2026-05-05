@@ -66,11 +66,11 @@ class RuntimeManager:
         self._redundancy_local_ens35_ip: str | None = None
         self._heartbeat_stop = threading.Event()
         self._heartbeat_threads: list[threading.Thread] = []
-        # Standby: True after 备升主切换占位触发；为 True 时不累计 LostTimes、不解析心跳，仅等待主机 TCP 以回切
+        # 备机暂时升主后为 True；升主后仍监听冗余口，收到原主机心跳载荷则异步回切
         self._standby_switched_to_master = False
-        # True → plc_main 以影子备机运行（无现场 I/O 插件，仅冗余心跳由 Python 侧处理）
+        # True → plc_main 影子备机；暂时升主后为 False（非影子 PLC）
         self._plc_shadow_standby = False
-        # 备机升主后：TCP 心跳发往原主机（冗余口 master_ip）； False 时发往 standby_ip
+        # 备机已暂时升主且 PLC 非影子（永久 is_master 仍由 ini 第 1–2 行决定）
         self._promoted_standby_acting_master = False
         # 备升主过程中避免 monitor 线程误重启 PLC
         self._manual_plc_restart_in_progress = False
@@ -214,6 +214,20 @@ class RuntimeManager:
         lines[3] = line4
         ini_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
+    @staticmethod
+    def write_redundancy_ini_standby_backup_lines(ini_path: Path, line5: str, line6: str) -> None:
+        """Write lines 5–6 (1-based): 升主前备机 ens33/ens34 功能地址，供回切恢复。"""
+        if ini_path.is_file():
+            text = ini_path.read_text(encoding="utf-8", errors="replace")
+        else:
+            text = ""
+        lines = text.splitlines()
+        while len(lines) < 6:
+            lines.append("")
+        lines[4] = line5
+        lines[5] = line6
+        ini_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
     def _read_functional_cidr_from_ini(self, ini_path: Path) -> tuple[str | None, str | None]:
         """Parse lines 3–4 as IPv4 interface CIDR (comments stripped)."""
         try:
@@ -237,6 +251,30 @@ class RuntimeManager:
                 return None
 
         return one(2), one(3)
+
+    def _read_standby_backup_cidr_from_ini(self, ini_path: Path) -> tuple[str | None, str | None]:
+        """Parse lines 5–6：回切时恢复到 ens33/ens34。"""
+        try:
+            text = ini_path.read_text(encoding="utf-8", errors="replace")
+        except OSError as e:
+            logger.error("[热冗余] 读取备机功能 IP 备份行失败: %s", e)
+            return None, None
+
+        lines = text.splitlines()
+        while len(lines) < 6:
+            lines.append("")
+
+        def one(idx: int) -> str | None:
+            raw = lines[idx].split("#", 1)[0].strip()
+            if not raw:
+                return None
+            try:
+                return str(ipaddress.IPv4Interface(raw))
+            except ValueError:
+                logger.warning("[热冗余] 第 %d 行不是有效 IPv4/CIDR: %r", idx + 1, raw[:64])
+                return None
+
+        return one(4), one(5)
 
     @staticmethod
     def _apply_ipv4_cidr_to_linux_interface(ifname: str, cidr: str) -> bool:
@@ -319,7 +357,7 @@ class RuntimeManager:
     def _evaluate_redundancy_role(self) -> None:
         """
         Load redundancy_role.ini, compare with local ens35 address, set is_master / is_redundancy.
-        Detailed logs are in Chinese.
+        is_master 仅由 ini 第 1–2 行决定；备升主为暂时状态，不改变 is_master。
         """
         self.is_master = False
         self.is_redundancy = False
@@ -448,11 +486,32 @@ class RuntimeManager:
 
     def _redundancy_trigger_standby_to_master_switch(self) -> None:
         """
-        备升主：从 redundancy_role.ini 第 3–4 行读取主机功能 IP，配置本机 ens33/ens34；
-        切换为主机角色，停止影子 PLC，正常加载 I/O 插件；LostTimes 不再累计（改为主机心跳线程）。
+        备升主（暂时）：先将本机 ens33/ens34 写入 ini 第 5–6 行，再应用第 3–4 行主机功能 IP；
+        PLC 非影子；is_master 不变；继续监听冗余口，收到原主机心跳载荷后异步回切。
         """
-        logger.info("[热冗余][备机] 备机升主机已触发")
+        logger.info("[热冗余][备机] 备机升主机已触发（暂时，ini 永久角色不变）")
         ini_path = self._openplc_project_root() / REDUNDANCY_ROLE_FILENAME
+        standby33 = self._ipv4_cidr_for_interface(REDUNDANCY_FUNCTIONAL_NIC_A)
+        standby34 = self._ipv4_cidr_for_interface(REDUNDANCY_FUNCTIONAL_NIC_B)
+        if not standby33 or not standby34:
+            logger.error(
+                "[热冗余][备机] 升主中止：无法读取本机 %s/%s 的 IPv4/CIDR",
+                REDUNDANCY_FUNCTIONAL_NIC_A,
+                REDUNDANCY_FUNCTIONAL_NIC_B,
+            )
+            return
+        try:
+            self.write_redundancy_ini_standby_backup_lines(ini_path, standby33, standby34)
+            logger.info(
+                "[热冗余][备机] 已写入备机功能地址到 %s 第 5–6 行: %s, %s",
+                ini_path,
+                standby33,
+                standby34,
+            )
+        except OSError as e:
+            logger.error("[热冗余][备机] 写入第 5–6 行失败: %s", e)
+            return
+
         c33, c34 = self._read_functional_cidr_from_ini(ini_path)
         if not c33 or not c34:
             logger.error(
@@ -466,7 +525,6 @@ class RuntimeManager:
             return
 
         self._standby_switched_to_master = True
-        self.is_master = True
         self._plc_shadow_standby = False
         self._promoted_standby_acting_master = True
 
@@ -478,11 +536,21 @@ class RuntimeManager:
         self._start_redundancy_heartbeat_threads()
 
     def _redundancy_trigger_failback_to_standby(self) -> None:
-        """原主机恢复连入后的回切占位：恢复备机影子运行（可选重启 PLC）。"""
+        """收到原主机冗余心跳后回切：按 ini 第 5–6 行恢复 ens33/ens34，影子 PLC。"""
         logger.info("[热冗余][备机] 回切备机已触发")
+        ini_path = self._openplc_project_root() / REDUNDANCY_ROLE_FILENAME
+        b33, b34 = self._read_standby_backup_cidr_from_ini(ini_path)
+        if b33 and b34:
+            self._apply_ipv4_cidr_to_linux_interface(REDUNDANCY_FUNCTIONAL_NIC_A, b33)
+            self._apply_ipv4_cidr_to_linux_interface(REDUNDANCY_FUNCTIONAL_NIC_B, b34)
+        else:
+            logger.warning(
+                "[热冗余][备机] 第 5–6 行无效，跳过恢复功能口 IP（请检查 %s）",
+                ini_path,
+            )
+
         self._standby_switched_to_master = False
         self._promoted_standby_acting_master = False
-        self.is_master = False
         self._plc_shadow_standby = True
         self._shutdown_redundancy_heartbeat_threads()
         try:
@@ -580,19 +648,39 @@ class RuntimeManager:
                 REDUNDANCY_STANDBY_LOST_THRESHOLD_SEC,
             )
             return 0, False
-        self._redundancy_trigger_standby_to_master_switch()
+        self._schedule_async_standby_to_master_switch()
         return 0, True
+
+    def _schedule_async_standby_to_master_switch(self) -> None:
+        """备机心跳线程内触发升主须异步执行，避免 shutdown/join 当前线程死锁。"""
+
+        def runner() -> None:
+            time.sleep(0.05)
+            try:
+                self._redundancy_trigger_standby_to_master_switch()
+            except Exception as e:
+                logger.error("[热冗余][备机] 异步备升主异常: %s", e)
+
+        threading.Thread(target=runner, daemon=True, name="async-standby-to-master").start()
+
+    def _schedule_async_failback_to_standby(self) -> None:
+        """备机心跳线程内触发回切须异步执行。"""
+
+        def runner() -> None:
+            time.sleep(0.05)
+            try:
+                self._redundancy_trigger_failback_to_standby()
+            except Exception as e:
+                logger.warning("[热冗余][备机] 异步回切异常: %s", e)
+
+        threading.Thread(target=runner, daemon=True, name="async-failback-standby").start()
 
     def _redundancy_master_tcp_heartbeat_loop(self) -> None:
         """
         每秒：TCP 已连接则发送心跳；否则尝试连接备机。无数、无超时切换、永久循环直至 stop。
         """
         local_ip = self._redundancy_local_ens35_ip
-        peer_ip = (
-            self._redundancy_master_ip
-            if self._promoted_standby_acting_master
-            else self._redundancy_standby_ip
-        )
+        peer_ip = self._redundancy_standby_ip
         if not local_ip or not peer_ip:
             return
         sock: socket.socket | None = None
@@ -660,11 +748,11 @@ class RuntimeManager:
 
     def _redundancy_standby_tcp_heartbeat_loop(self) -> None:
         """
-        备机：纯备机态每秒 LostTimes+1，>阈值则 ping 主机，不通则备升主；
-        收到心跳立即清零；断连继续累计；已切换为主则不计数、不检测心跳，仅等主机 TCP 回切；
-        主机恢复：已切换→回切占位；未切换→清零计数。
+        备机：纯备机态 LostTimes / 升主；暂时升主后仍监听，accept 超时不计数，
+        收到原主机发来的心跳载荷后异步回切（影子 PLC + 恢复第 5–6 行功能 IP）。
         """
         local_ip = self._redundancy_local_ens35_ip
+        master_redundancy_ip = self._redundancy_master_ip
         if not local_ip:
             return
         server: socket.socket | None = None
@@ -681,7 +769,8 @@ class RuntimeManager:
             )
             server.settimeout(REDUNDANCY_STANDBY_RECV_IDLE_SEC)
             while not self._heartbeat_stop.is_set():
-                if self._standby_switched_to_master:
+                promoted = self._standby_switched_to_master and self._promoted_standby_acting_master
+                if promoted:
                     try:
                         client, addr = server.accept()
                     except TimeoutError:
@@ -691,17 +780,63 @@ class RuntimeManager:
                             break
                         logger.error("[热冗余][备机] accept 失败: %s", e)
                         continue
+                    if master_redundancy_ip and addr[0] != master_redundancy_ip:
+                        logger.warning(
+                            "[热冗余][备机] 升主状态下收到非配置主机冗余 IP 的连入 %s，忽略",
+                            addr[0],
+                        )
+                        try:
+                            client.close()
+                        except OSError:
+                            pass
+                        continue
                     logger.info(
-                        "[热冗余][备机] 主机恢复 TCP 连入（当前为已切换为主状态），对端=%s:%d，执行回切。",
+                        "[热冗余][备机] 原主机 TCP 已连入（升主监听态），对端=%s:%d，等待心跳包以回切",
                         addr[0],
                         addr[1],
                     )
+                    buf = b""
+                    client_live = client
                     try:
-                        client.close()
-                    except OSError:
-                        pass
-                    self._redundancy_trigger_failback_to_standby()
-                    lost_times = 0
+                        client_live.settimeout(REDUNDANCY_STANDBY_RECV_IDLE_SEC)
+                        while (
+                            not self._heartbeat_stop.is_set()
+                            and self._standby_switched_to_master
+                            and self._promoted_standby_acting_master
+                        ):
+                            try:
+                                chunk = client_live.recv(4096)
+                            except (TimeoutError, socket.timeout):
+                                continue
+                            except OSError as e:
+                                logger.warning("[热冗余][备机] 升主监听 recv 错误: %s", e)
+                                break
+                            if not chunk:
+                                break
+                            buf += chunk
+                            while True:
+                                idx = buf.find(REDUNDANCY_HB_PAYLOAD)
+                                if idx < 0:
+                                    if len(buf) > 65536:
+                                        buf = buf[-4096:]
+                                    break
+                                buf = buf[idx + len(REDUNDANCY_HB_PAYLOAD) :]
+                                logger.info("[热冗余][备机] 收到原主机心跳，触发自动回切")
+                                self._schedule_async_failback_to_standby()
+                                try:
+                                    client_live.close()
+                                except OSError:
+                                    pass
+                                client_live = None
+                                break
+                            if client_live is None:
+                                break
+                    finally:
+                        if client_live is not None:
+                            try:
+                                client_live.close()
+                            except OSError:
+                                pass
                     continue
 
                 try:
