@@ -38,6 +38,9 @@ REDUNDANCY_MASTER_HEARTBEAT_INTERVAL_SEC = 1.0
 REDUNDANCY_STANDBY_RECV_IDLE_SEC = 1.0
 # Standby: seconds without TCP heartbeat before ping master for failover decision
 REDUNDANCY_STANDBY_LOST_THRESHOLD_SEC = 5
+# Functional I/O NICs (lines 3–4 of redundancy_role.ini record host IPv4/prefix)
+REDUNDANCY_FUNCTIONAL_NIC_A = "ens33"
+REDUNDANCY_FUNCTIONAL_NIC_B = "ens34"
 
 
 class RuntimeManager:
@@ -67,6 +70,10 @@ class RuntimeManager:
         self._standby_switched_to_master = False
         # True → plc_main 以影子备机运行（无现场 I/O 插件，仅冗余心跳由 Python 侧处理）
         self._plc_shadow_standby = False
+        # 备机升主后：TCP 心跳发往原主机（冗余口 master_ip）； False 时发往 standby_ip
+        self._promoted_standby_acting_master = False
+        # 备升主过程中避免 monitor 线程误重启 PLC
+        self._manual_plc_restart_in_progress = False
 
     @staticmethod
     def _openplc_project_root() -> Path:
@@ -96,6 +103,29 @@ class RuntimeManager:
             for i, token in enumerate(parts):
                 if token == "inet" and i + 1 < len(parts):
                     return parts[i + 1].split("/")[0].strip()
+        return None
+
+    @staticmethod
+    def _ipv4_cidr_for_interface(ifname: str) -> str | None:
+        """First IPv4 address on ifname as 'a.b.c.d/prefix', or None."""
+        try:
+            out = subprocess.check_output(
+                ["ip", "-4", "-o", "addr", "show", "dev", ifname],
+                stderr=subprocess.DEVNULL,
+                text=True,
+                timeout=5,
+            )
+        except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+            return None
+        for line in out.splitlines():
+            parts = line.split()
+            for i, token in enumerate(parts):
+                if token == "inet" and i + 1 < len(parts):
+                    cidr = parts[i + 1].strip()
+                    try:
+                        return str(ipaddress.IPv4Interface(cidr))
+                    except ValueError:
+                        continue
         return None
 
     @staticmethod
@@ -170,6 +200,122 @@ class RuntimeManager:
 
         return master_ip, standby_ip
 
+    @staticmethod
+    def write_redundancy_ini_functional_lines(ini_path: Path, line3: str, line4: str) -> None:
+        """Write lines 3–4 (1-based) with functional NIC IPv4/prefix; preserve lines 1–2."""
+        if ini_path.is_file():
+            text = ini_path.read_text(encoding="utf-8", errors="replace")
+        else:
+            text = ""
+        lines = text.splitlines()
+        while len(lines) < 4:
+            lines.append("")
+        lines[2] = line3
+        lines[3] = line4
+        ini_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    def _read_functional_cidr_from_ini(self, ini_path: Path) -> tuple[str | None, str | None]:
+        """Parse lines 3–4 as IPv4 interface CIDR (comments stripped)."""
+        try:
+            text = ini_path.read_text(encoding="utf-8", errors="replace")
+        except OSError as e:
+            logger.error("[热冗余] 读取功能 IP 行失败: %s", e)
+            return None, None
+
+        lines = text.splitlines()
+        while len(lines) < 4:
+            lines.append("")
+
+        def one(idx: int) -> str | None:
+            raw = lines[idx].split("#", 1)[0].strip()
+            if not raw:
+                return None
+            try:
+                return str(ipaddress.IPv4Interface(raw))
+            except ValueError:
+                logger.warning("[热冗余] 第 %d 行不是有效 IPv4/CIDR: %r", idx + 1, raw[:64])
+                return None
+
+        return one(2), one(3)
+
+    @staticmethod
+    def _apply_ipv4_cidr_to_linux_interface(ifname: str, cidr: str) -> bool:
+        """Replace primary IPv4 on interface using ip(8). Requires appropriate privileges."""
+        try:
+            subprocess.run(
+                ["ip", "addr", "flush", "dev", ifname],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            r = subprocess.run(
+                ["ip", "addr", "add", cidr, "dev", ifname],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            if r.returncode != 0:
+                logger.error(
+                    "[热冗余] ip addr add 失败 %s %s: %s",
+                    ifname,
+                    cidr,
+                    (r.stderr or r.stdout or "").strip(),
+                )
+                return False
+            subprocess.run(
+                ["ip", "link", "set", ifname, "up"],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            logger.info("[热冗余] 已为 %s 设置地址 %s", ifname, cidr)
+            return True
+        except (OSError, subprocess.TimeoutExpired) as e:
+            logger.error("[热冗余] 配置 %s 地址异常: %s", ifname, e)
+            return False
+
+    def _record_functional_ips_and_sync_standby_thread(self) -> None:
+        """主机：将 ens33/ens34 的 IPv4/掩码写入 redundancy_role.ini 第 3–4 行并同步到备机。"""
+        try:
+            ini_path = self._openplc_project_root() / REDUNDANCY_ROLE_FILENAME
+            if not ini_path.is_file():
+                return
+            c33 = self._ipv4_cidr_for_interface(REDUNDANCY_FUNCTIONAL_NIC_A)
+            c34 = self._ipv4_cidr_for_interface(REDUNDANCY_FUNCTIONAL_NIC_B)
+            if not c33 or not c34:
+                logger.warning(
+                    "[热冗余] 功能 IP 记录跳过：%s=%s, %s=%s（需两网卡均有 IPv4）",
+                    REDUNDANCY_FUNCTIONAL_NIC_A,
+                    c33,
+                    REDUNDANCY_FUNCTIONAL_NIC_B,
+                    c34,
+                )
+                return
+            self.write_redundancy_ini_functional_lines(ini_path, c33, c34)
+            logger.info(
+                "[热冗余] 已记录功能口地址到 %s 第3–4行: %s=%s, %s=%s",
+                ini_path,
+                REDUNDANCY_FUNCTIONAL_NIC_A,
+                c33,
+                REDUNDANCY_FUNCTIONAL_NIC_B,
+                c34,
+            )
+            secret = os.environ.get("OPENPLC_REDUNDANCY_SYNC_SECRET", "").strip()
+            standby_ip = self._redundancy_standby_ip
+            if not secret or not standby_ip:
+                logger.warning(
+                    "[热冗余] 未设置 OPENPLC_REDUNDANCY_SYNC_SECRET 或备机 IP，跳过同步 redundancy_role.ini"
+                )
+                return
+            from webserver.redundancy_program_sync import push_role_ini_functional_to_standby
+
+            push_role_ini_functional_to_standby(standby_ip, c33, c34, secret)
+        except Exception as e:
+            logger.error("[热冗余] 功能 IP 记录/同步异常: %s", e)
+
     def _evaluate_redundancy_role(self) -> None:
         """
         Load redundancy_role.ini, compare with local ens35 address, set is_master / is_redundancy.
@@ -181,6 +327,7 @@ class RuntimeManager:
         self._redundancy_standby_ip = None
         self._redundancy_local_ens35_ip = None
         self._plc_shadow_standby = False
+        self._promoted_standby_acting_master = False
 
         project_root = self._openplc_project_root()
         ini_path = project_root / REDUNDANCY_ROLE_FILENAME
@@ -242,6 +389,11 @@ class RuntimeManager:
                 REDUNDANCY_NIC,
                 REDUNDANCY_HEARTBEAT_PORT,
             )
+            threading.Thread(
+                target=self._record_functional_ips_and_sync_standby_thread,
+                daemon=True,
+                name="redundancy-record-functional-ip",
+            ).start()
             return
 
         if local_ip == standby_ip:
@@ -295,14 +447,124 @@ class RuntimeManager:
             return False
 
     def _redundancy_trigger_standby_to_master_switch(self) -> None:
-        """备升主切换占位：后续在此实现停备机业务、夺权等逻辑。"""
+        """
+        备升主：从 redundancy_role.ini 第 3–4 行读取主机功能 IP，配置本机 ens33/ens34；
+        切换为主机角色，停止影子 PLC，正常加载 I/O 插件；LostTimes 不再累计（改为主机心跳线程）。
+        """
         logger.info("[热冗余][备机] 备机升主机已触发")
+        ini_path = self._openplc_project_root() / REDUNDANCY_ROLE_FILENAME
+        c33, c34 = self._read_functional_cidr_from_ini(ini_path)
+        if not c33 or not c34:
+            logger.error(
+                "[热冗余][备机] 升主中止：%s 第 3、4 行缺少有效的 IPv4/CIDR（需先由主机记录功能 IP）",
+                ini_path,
+            )
+            return
+        if not self._apply_ipv4_cidr_to_linux_interface(REDUNDANCY_FUNCTIONAL_NIC_A, c33):
+            return
+        if not self._apply_ipv4_cidr_to_linux_interface(REDUNDANCY_FUNCTIONAL_NIC_B, c34):
+            return
+
         self._standby_switched_to_master = True
+        self.is_master = True
+        self._plc_shadow_standby = False
+        self._promoted_standby_acting_master = True
+
+        self._shutdown_redundancy_heartbeat_threads()
+        try:
+            self._restart_plc_core_after_takeover()
+        except Exception as e:
+            logger.error("[热冗余][备机] 升主后重启 PLC 核心失败: %s", e)
+        self._start_redundancy_heartbeat_threads()
 
     def _redundancy_trigger_failback_to_standby(self) -> None:
-        """主降备回切占位：后续在此实现停 MTU、恢复 IP 等逻辑。"""
+        """原主机恢复连入后的回切占位：恢复备机影子运行（可选重启 PLC）。"""
         logger.info("[热冗余][备机] 回切备机已触发")
         self._standby_switched_to_master = False
+        self._promoted_standby_acting_master = False
+        self.is_master = False
+        self._plc_shadow_standby = True
+        self._shutdown_redundancy_heartbeat_threads()
+        try:
+            self._restart_plc_core_shadow_standby_after_failback()
+        except Exception as e:
+            logger.warning("[热冗余][备机] 回切后重启影子 PLC 失败（可手动重启运行时）: %s", e)
+        self._start_redundancy_heartbeat_threads()
+
+    def _restart_plc_core_after_takeover(self) -> None:
+        """终止当前 plc_main 并以非影子方式重启并 START（需 root/rt 权限场景与常规一致）。"""
+        self._manual_plc_restart_in_progress = True
+        try:
+            try:
+                self.runtime_socket.send_message("STOP\n")
+            except (OSError, socket.error, RuntimeError):
+                pass
+            time.sleep(0.5)
+            self._safe_close_runtime_socket()
+            if self.process:
+                if HAS_PSUTIL and isinstance(self.process, psutil.Process):
+                    self.process.terminate()
+                    try:
+                        self.process.wait(timeout=5)
+                    except (psutil.TimeoutExpired, psutil.Error):
+                        self.process.kill()
+                elif isinstance(self.process, subprocess.Popen):
+                    self.process.terminate()
+                    try:
+                        self.process.wait(timeout=5)
+                    except (subprocess.TimeoutExpired, subprocess.SubprocessError):
+                        self.process.kill()
+                self.process = None
+            time.sleep(0.5)
+            self._safe_start_log_server()
+            cmd = [self.runtime_path]
+            if self.print_debug:
+                cmd.append("--print-debug")
+            self.process = subprocess.Popen(cmd)
+            time.sleep(1)
+            self._safe_connect_runtime_socket()
+            self.start_plc()
+            logger.info("[热冗余][备机] 已切换为非影子 plc_main 并已下发 START")
+        finally:
+            self._manual_plc_restart_in_progress = False
+
+    def _restart_plc_core_shadow_standby_after_failback(self) -> None:
+        """回切备机后重启影子 plc_main。"""
+        self._manual_plc_restart_in_progress = True
+        try:
+            try:
+                self.runtime_socket.send_message("STOP\n")
+            except (OSError, socket.error, RuntimeError):
+                pass
+            time.sleep(0.5)
+            self._safe_close_runtime_socket()
+            if self.process:
+                if HAS_PSUTIL and isinstance(self.process, psutil.Process):
+                    self.process.terminate()
+                    try:
+                        self.process.wait(timeout=5)
+                    except (psutil.TimeoutExpired, psutil.Error):
+                        self.process.kill()
+                elif isinstance(self.process, subprocess.Popen):
+                    self.process.terminate()
+                    try:
+                        self.process.wait(timeout=5)
+                    except (subprocess.TimeoutExpired, subprocess.SubprocessError):
+                        self.process.kill()
+                self.process = None
+            time.sleep(0.5)
+            self._safe_start_log_server()
+            cmd = [self.runtime_path]
+            if self.print_debug:
+                cmd.append("--print-debug")
+            cmd.append("--shadow-standby")
+            self.process = subprocess.Popen(cmd)
+            time.sleep(1)
+            self._safe_connect_runtime_socket()
+            self.start_plc()
+            logger.info("[热冗余][备机] 已回切为影子 plc_main 并已下发 START")
+        finally:
+            self._manual_plc_restart_in_progress = False
 
     def _standby_tick_lost_times(self, lost_times: int) -> tuple[int, bool]:
         """
@@ -326,8 +588,12 @@ class RuntimeManager:
         每秒：TCP 已连接则发送心跳；否则尝试连接备机。无数、无超时切换、永久循环直至 stop。
         """
         local_ip = self._redundancy_local_ens35_ip
-        standby_ip = self._redundancy_standby_ip
-        if not local_ip or not standby_ip:
+        peer_ip = (
+            self._redundancy_master_ip
+            if self._promoted_standby_acting_master
+            else self._redundancy_standby_ip
+        )
+        if not local_ip or not peer_ip:
             return
         sock: socket.socket | None = None
         first_send_logged = False
@@ -338,11 +604,11 @@ class RuntimeManager:
                     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
                     sock.bind((local_ip, 0))
                     sock.settimeout(10.0)
-                    sock.connect((standby_ip, REDUNDANCY_HEARTBEAT_PORT))
+                    sock.connect((peer_ip, REDUNDANCY_HEARTBEAT_PORT))
                 except OSError as e:
                     logger.warning(
-                        "[热冗余][主机] 连接备机 TCP %s:%d 失败，将在 %.1f 秒后重试: %s",
-                        standby_ip,
+                        "[热冗余][主机] 连接对端 TCP %s:%d 失败，将在 %.1f 秒后重试: %s",
+                        peer_ip,
                         REDUNDANCY_HEARTBEAT_PORT,
                         REDUNDANCY_MASTER_HEARTBEAT_INTERVAL_SEC,
                         e,
@@ -375,8 +641,8 @@ class RuntimeManager:
 
             if not first_send_logged:
                 logger.info(
-                    "[热冗余][主机] 第一次开始向备机发送 TCP 心跳包（备机=%s:%d，本机源地址=%s）。",
-                    standby_ip,
+                    "[热冗余][主机] 第一次开始发送 TCP 心跳包（对端=%s:%d，本机源地址=%s）。",
+                    peer_ip,
                     REDUNDANCY_HEARTBEAT_PORT,
                     local_ip,
                 )
@@ -505,7 +771,6 @@ class RuntimeManager:
         self._shutdown_redundancy_heartbeat_threads()
         # New cycle needs a clear stop event (previous stop() left it set).
         self._heartbeat_stop = threading.Event()
-        self._standby_switched_to_master = False
         if not self.is_redundancy:
             return
         if self.is_master:
@@ -689,6 +954,9 @@ class RuntimeManager:
         Tracks crash frequency and enters safe mode after repeated failures.
         """
         while self.running:
+            if self._manual_plc_restart_in_progress:
+                time.sleep(0.3)
+                continue
             if not self.is_runtime_alive():
                 logger.warning("PLC runtime process died unexpectedly")
                 self._safe_stop_log_server()

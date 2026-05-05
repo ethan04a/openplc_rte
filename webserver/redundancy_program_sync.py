@@ -5,6 +5,7 @@ Standby receives via /api/redundancy/receive-program (shared secret header).
 
 from __future__ import annotations
 
+import ipaddress
 import os
 import threading
 import time
@@ -20,7 +21,7 @@ from webserver.plcapp_management import (
     build_state,
 )
 from webserver.restapi import restapi_bp
-from webserver.runtimemanager import RuntimeManager
+from webserver.runtimemanager import REDUNDANCY_ROLE_FILENAME, RuntimeManager
 
 logger, _ = get_logger("runtime", use_buffer=True)
 
@@ -67,6 +68,29 @@ def register_redundancy_sync_routes(runtime_manager: RuntimeManager) -> None:
             return jsonify(result), 400
         return jsonify(result), 200
 
+    @restapi_bp.route("/redundancy/sync-role-ini", methods=["POST"])
+    def redundancy_sync_role_ini():
+        expected = os.environ.get(REDUNDANCY_SYNC_SECRET_ENV, "").strip()
+        if not expected:
+            return jsonify({"error": "redundancy sync disabled"}), 503
+        if request.headers.get("X-OpenPLC-Redundancy-Sync") != expected:
+            return jsonify({"error": "forbidden"}), 403
+        data = request.get_json(silent=True) or {}
+        line3 = str(data.get("line3", "")).strip()
+        line4 = str(data.get("line4", "")).strip()
+        try:
+            ipaddress.IPv4Interface(line3)
+            ipaddress.IPv4Interface(line4)
+        except ValueError:
+            return jsonify({"error": "line3 and line4 must be IPv4/prefix"}), 400
+        ini_path = RuntimeManager._openplc_project_root() / REDUNDANCY_ROLE_FILENAME
+        try:
+            RuntimeManager.write_redundancy_ini_functional_lines(ini_path, line3, line4)
+        except OSError as e:
+            return jsonify({"error": str(e)}), 500
+        logger.info("[热冗余] 已接收主机同步的 redundancy_role.ini 功能行: %s, %s", line3, line4)
+        return jsonify({"ok": True}), 200
+
 
 def _wait_for_running(runtime_manager: RuntimeManager, timeout_sec: float = 15.0) -> bool:
     deadline = time.monotonic() + timeout_sec
@@ -103,6 +127,29 @@ def push_program_zip_to_standby(standby_ip: str, zip_path: Path, secret: str) ->
         )
         return
     logger.info("[热冗余] 已向备机 %s 推送程序并开始其编译流程（HTTP %s）", standby_ip, resp.status_code)
+
+
+def push_role_ini_functional_to_standby(standby_ip: str, line3: str, line4: str, secret: str) -> None:
+    import urllib3
+    import requests
+
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+    url = f"https://{standby_ip}:8443/api/redundancy/sync-role-ini"
+    resp = requests.post(
+        url,
+        headers={"X-OpenPLC-Redundancy-Sync": secret, "Content-Type": "application/json"},
+        json={"line3": line3, "line4": line4},
+        verify=False,
+        timeout=60,
+    )
+    if resp.status_code >= 400:
+        logger.error(
+            "[热冗余] 同步 redundancy_role.ini 功能行至备机失败: HTTP %s %s",
+            resp.status_code,
+            resp.text[:500],
+        )
+        return
+    logger.info("[热冗余] 已向备机 %s 同步 redundancy_role.ini 第3–4行（HTTP %s）", standby_ip, resp.status_code)
 
 
 def schedule_master_to_standby_sync(runtime_manager: RuntimeManager) -> None:
