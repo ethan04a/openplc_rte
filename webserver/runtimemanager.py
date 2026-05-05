@@ -948,6 +948,7 @@ class RuntimeManager:
             logger.info("[热冗余][备机] TCP 心跳监听线程已退出。")
 
     def _redundancy_image_sync_master_loop(self) -> None:
+        return
         """Push I/O snapshots to standby over TCP (redundancy NIC)."""
         standby_ip = self._redundancy_standby_ip
         if not standby_ip:
@@ -1009,6 +1010,7 @@ class RuntimeManager:
             logger.info("[热冗余][主机] I/O 镜像同步发送线程已退出。")
 
     def _redundancy_image_sync_standby_loop(self) -> None:
+        return
         """Receive I/O snapshots from master and apply via Unix socket."""
         local_ip = self._redundancy_local_ens35_ip
         master_ip = self._redundancy_master_ip
