@@ -9,10 +9,12 @@ from webserver.logger.config import LoggerConfig
 LoggerConfig.print_debug = _print_debug
 
 import errno
+import ipaddress
 import json
 import os
 import platform
 import ssl
+import subprocess
 import threading
 from pathlib import Path
 from typing import Callable, Final, Optional
@@ -58,6 +60,105 @@ BASE_DIR: Final[Path] = Path(__file__).parent
 CERT_FILE: Final[Path] = (BASE_DIR / "certOPENPLC.pem").resolve()
 KEY_FILE: Final[Path] = (BASE_DIR / "keyOPENPLC.pem").resolve()
 HOSTNAME: Final[str] = "localhost"
+
+FUNCTIONAL_IP_INI: Final[Path] = (BASE_DIR.parent / "functional_ip.ini").resolve()
+
+
+def _apply_ip_to_interface(interface: str, cidr: str) -> bool:
+    """
+    使用 ip 命令将 CIDR 地址配置到指定网卡（先 flush 再 add，最后 up）。
+    返回是否成功。
+    """
+    flush = subprocess.run(
+        ["ip", "addr", "flush", "dev", interface],
+        capture_output=True,
+        text=True,
+    )
+    if flush.returncode != 0:
+        logger.warning(
+            "清除网卡 %s 地址失败（返回码 %s）：%s",
+            interface,
+            flush.returncode,
+            (flush.stderr or flush.stdout or "").strip(),
+        )
+
+    add = subprocess.run(
+        ["ip", "addr", "add", cidr, "dev", interface],
+        capture_output=True,
+        text=True,
+    )
+    if add.returncode != 0:
+        logger.error(
+            "为网卡 %s 设置地址 %s 失败（返回码 %s）：%s",
+            interface,
+            cidr,
+            add.returncode,
+            (add.stderr or add.stdout or "").strip(),
+        )
+        return False
+
+    up = subprocess.run(
+        ["ip", "link", "set", interface, "up"],
+        capture_output=True,
+        text=True,
+    )
+    if up.returncode != 0:
+        logger.warning(
+            "启用网卡 %s 失败（返回码 %s）：%s",
+            interface,
+            up.returncode,
+            (up.stderr or up.stdout or "").strip(),
+        )
+    return True
+
+
+def configure_network_from_functional_ip() -> None:
+    """
+    读取 functional_ip.ini 前两行：第一行配置 ens33，第二行配置 ens34。
+    每行格式为「IP/前缀长度」（CIDR）。文件不存在或内容为空时不做任何网卡设置。
+    """
+    if platform.system() != "Linux":
+        logger.info("当前系统不是 Linux，跳过根据 functional_ip.ini 配置网卡。")
+        return
+
+    if not FUNCTIONAL_IP_INI.is_file():
+        logger.info("未找到 functional_ip.ini，跳过网卡配置。")
+        return
+
+    try:
+        content = FUNCTIONAL_IP_INI.read_text(encoding="utf-8")
+    except OSError as exc:
+        logger.error("读取 functional_ip.ini 失败：%s", exc)
+        return
+
+    if not content.strip():
+        logger.info("functional_ip.ini 为空，跳过网卡配置。")
+        return
+
+    raw_lines = content.splitlines()
+    line1 = raw_lines[0].strip() if len(raw_lines) > 0 else ""
+    line2 = raw_lines[1].strip() if len(raw_lines) > 1 else ""
+
+    pairs: list[tuple[str, str]] = []
+    if line1:
+        pairs.append(("ens33", line1))
+    if line2:
+        pairs.append(("ens34", line2))
+
+    if not pairs:
+        logger.info("functional_ip.ini 前两行均无有效内容，跳过网卡配置。")
+        return
+
+    for interface, line in pairs:
+        try:
+            ipaddress.ip_interface(line)
+        except ValueError:
+            logger.error("网卡 %s 对应行格式无效（需为 IP/前缀，例如 192.168.1.1/24）：%s", interface, line)
+            continue
+
+        logger.info("正在为网卡 %s 配置地址 %s …", interface, line)
+        if _apply_ip_to_interface(interface, line):
+            logger.info("网卡 %s 已设置为 %s。", interface, line)
 
 
 def handle_start_plc(data: dict) -> dict:
@@ -313,4 +414,5 @@ def run_https():
 
 
 if __name__ == "__main__":
+    configure_network_from_functional_ip()
     run_https()
