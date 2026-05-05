@@ -102,6 +102,9 @@ class RuntimeManager:
         self._promoted_standby_acting_master = False
         # 备升主过程中避免 monitor 线程误重启 PLC
         self._manual_plc_restart_in_progress = False
+        # 主机本地记录完成后，等待“TCP 心跳已连接备机”时再同步第 3–4 行
+        self._functional_lines_pending_sync: tuple[str, str] | None = None
+        self._functional_sync_lock = threading.Lock()
 
     @staticmethod
     def _openplc_project_root() -> Path:
@@ -344,7 +347,7 @@ class RuntimeManager:
             return False
 
     def _record_functional_ips_and_sync_standby_thread(self) -> None:
-        """主机：将 ens33/ens34 的 IPv4/掩码写入 redundancy_role.ini 第 3–4 行并同步到备机。"""
+        """主机：将 ens33/ens34 的 IPv4/掩码写入 redundancy_role.ini 第 3–4 行。"""
         try:
             ini_path = self._openplc_project_root() / REDUNDANCY_ROLE_FILENAME
             if not ini_path.is_file():
@@ -369,15 +372,33 @@ class RuntimeManager:
                 REDUNDANCY_FUNCTIONAL_NIC_B,
                 c34,
             )
-            standby_ip = self._redundancy_standby_ip
-            if not standby_ip:
-                logger.warning("[热冗余] 未配置备机 IP，跳过同步 redundancy_role.ini")
-                return
+            with self._functional_sync_lock:
+                self._functional_lines_pending_sync = (c33, c34)
+            logger.info("[热冗余] 功能口第3–4行已标记待同步，等待主备 TCP 心跳连接建立后再推送。")
+        except Exception as e:
+            logger.error("[热冗余] 功能 IP 记录异常: %s", e)
+
+    def _sync_functional_lines_after_tcp_connect(self) -> None:
+        """主机 TCP 心跳连上备机后，再尝试同步 redundancy_role.ini 第 3–4 行。"""
+        standby_ip = self._redundancy_standby_ip
+        if not standby_ip:
+            return
+        with self._functional_sync_lock:
+            pending = self._functional_lines_pending_sync
+        if not pending:
+            return
+
+        c33, c34 = pending
+        try:
             from webserver.redundancy_program_sync import push_role_ini_functional_to_standby
 
+            logger.info(
+                "[热冗余][主机] TCP 心跳连接已建立，开始同步 redundancy_role.ini 第3–4行到备机 %s。",
+                standby_ip,
+            )
             push_role_ini_functional_to_standby(standby_ip, c33, c34, REDUNDANCY_SYNC_SECRET)
         except Exception as e:
-            logger.error("[热冗余] 功能 IP 记录/同步异常: %s", e)
+            logger.error("[热冗余][主机] TCP 建连后同步第3–4行异常: %s", e)
 
     def _evaluate_redundancy_role(self) -> None:
         """
@@ -738,6 +759,7 @@ class RuntimeManager:
                     sock.bind((local_ip, 0))
                     sock.settimeout(10.0)
                     sock.connect((peer_ip, REDUNDANCY_HEARTBEAT_PORT))
+                    self._sync_functional_lines_after_tcp_connect()
                 except OSError as e:
                     logger.warning(
                         "[热冗余][主机] 连接对端 TCP %s:%d 失败，将在 %.1f 秒后重试: %s",
