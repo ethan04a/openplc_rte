@@ -48,18 +48,25 @@ class SyncUnixClient:
             return True
 
     def connect(self):
-        """Connect to the Unix socket server"""
-        if not os.path.exists(self.socket_path):
-            raise FileNotFoundError(f"Socket not found: {self.socket_path}")
+        """Connect to the Unix socket server.
 
-        try:
-            logger.debug("Connecting to socket %s", self.socket_path)
-            self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            self.sock.settimeout(1.0)  # 1s timeout on blocking calls
-            self.sock.connect(self.socket_path)
-            logger.debug("Connected to server socket %s", self.socket_path)
-        except Exception as e:
-            logger.error("Failed to connect: %s", e)
+        Idempotent: repeated calls reuse the existing socket so plc_main does not
+        log connect/disconnect storms from STATUS polling or redundancy loops.
+        """
+        with mutex:
+            if self.sock is not None:
+                return
+            if not os.path.exists(self.socket_path):
+                raise FileNotFoundError(f"Socket not found: {self.socket_path}")
+
+            try:
+                logger.debug("Connecting to socket %s", self.socket_path)
+                self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                self.sock.settimeout(1.0)  # 1s timeout on blocking calls
+                self.sock.connect(self.socket_path)
+                logger.debug("Connected to server socket %s", self.socket_path)
+            except Exception as e:
+                logger.error("Failed to connect: %s", e)
 
     def send_message(self, msg: str):
         if not self.sock:
@@ -275,9 +282,10 @@ class SyncUnixClient:
                 return None
 
     def close(self):
-        if self.sock:
-            logger.debug("Closing connection")
-            try:
-                self.sock.close()
-            finally:
-                self.sock = None
+        with mutex:
+            if self.sock:
+                logger.debug("Closing connection")
+                try:
+                    self.sock.close()
+                finally:
+                    self.sock = None

@@ -51,6 +51,9 @@ REDUNDANCY_STANDBY_LOST_THRESHOLD_SEC = 5
 REDUNDANCY_FUNCTIONAL_NIC_A = "ens33"
 REDUNDANCY_FUNCTIONAL_NIC_B = "ens34"
 
+# Throttle STATUS polling used by redundancy I/O mirror gating (avoid unix chatter).
+PLC_STATUS_CACHE_TTL_SEC = 0.2
+
 
 def _tcp_recv_exact(conn: socket.socket, n: int, timeout: float | None) -> bytes | None:
     """Read exactly n bytes from TCP stream."""
@@ -105,6 +108,9 @@ class RuntimeManager:
         # 主机本地记录完成后，等待“TCP 心跳已连接备机”时再同步第 3–4 行
         self._functional_lines_pending_sync: tuple[str, str] | None = None
         self._functional_sync_lock = threading.Lock()
+        self._plc_status_cache_lock = threading.Lock()
+        self._plc_status_cache_monotonic: float = 0.0
+        self._plc_status_cache_running: bool = False
 
     @staticmethod
     def _openplc_project_root() -> Path:
@@ -1231,13 +1237,31 @@ class RuntimeManager:
 
     def _plc_runtime_is_running(self) -> bool:
         """True if plc_main reports STATUS:RUNNING (I/O image tables safe for snapshot)."""
+        now = time.monotonic()
+        with self._plc_status_cache_lock:
+            if self._plc_status_cache_monotonic > 0.0 and (
+                now - self._plc_status_cache_monotonic
+            ) < PLC_STATUS_CACHE_TTL_SEC:
+                return self._plc_status_cache_running
+
         try:
-            self._safe_connect_runtime_socket()
             if not self.runtime_socket.is_connected():
+                self._safe_connect_runtime_socket()
+            if not self.runtime_socket.is_connected():
+                with self._plc_status_cache_lock:
+                    self._plc_status_cache_running = False
+                    self._plc_status_cache_monotonic = time.monotonic()
                 return False
             status = self.runtime_socket.send_and_receive("STATUS\n", timeout=0.5)
-            return status == "STATUS:RUNNING"
+            ok = status == "STATUS:RUNNING"
+            with self._plc_status_cache_lock:
+                self._plc_status_cache_running = ok
+                self._plc_status_cache_monotonic = time.monotonic()
+            return ok
         except (OSError, RuntimeError, TypeError, ValueError):
+            with self._plc_status_cache_lock:
+                self._plc_status_cache_running = False
+                self._plc_status_cache_monotonic = time.monotonic()
             return False
 
     def start(self):
