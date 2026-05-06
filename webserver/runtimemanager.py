@@ -580,7 +580,6 @@ class RuntimeManager:
         self._plc_shadow_standby = False
         self._promoted_standby_acting_master = True
 
-        self._shutdown_redundancy_heartbeat_threads()
         try:
             if self._try_redundancy_shadow_exit():
                 logger.info(
@@ -590,7 +589,7 @@ class RuntimeManager:
                 self._restart_plc_core_after_takeover()
         except Exception as e:
             logger.error("[热冗余][备机] 升主后切换 PLC 核心失败: %s", e)
-        self._start_redundancy_heartbeat_threads()
+        # Keep redundancy heartbeat/image threads alive; switch behavior via state flags only.
 
     def _try_redundancy_shadow_exit(self) -> bool:
         """Try to enable field I/O in-process without restarting plc_main."""
@@ -624,12 +623,11 @@ class RuntimeManager:
         self._standby_switched_to_master = False
         self._promoted_standby_acting_master = False
         self._plc_shadow_standby = True
-        self._shutdown_redundancy_heartbeat_threads()
         try:
             self._restart_plc_core_shadow_standby_after_failback()
         except Exception as e:
             logger.warning("[热冗余][备机] 回切后重启影子 PLC 失败（可手动重启运行时）: %s", e)
-        self._start_redundancy_heartbeat_threads()
+        # Keep redundancy heartbeat/image threads alive; switch behavior via state flags only.
 
     def _restart_plc_core_after_takeover(self) -> None:
         """终止当前 plc_main 并以非影子方式重启并 START（需 root/rt 权限场景与常规一致）。"""
