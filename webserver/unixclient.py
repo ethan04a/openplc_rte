@@ -12,6 +12,10 @@ mutex = Lock()
 IMAGE_SNAPSHOT_EXPECTED_BYTES = 1024 * 68
 IMAGE_SNAPSHOT_PROTOCOL_VERSION = 1
 
+# unix_socket.c refuses snapshot I/O when plc_main is not PLC_STATE_RUNNING
+IMAGE_SNAPSHOT_GET_NOT_READY = "IMAGE_SNAPSHOT_GET:NOT_READY"
+IMAGE_SNAPSHOT_SET_NOT_READY = "IMAGE_SNAPSHOT_SET:NOT_READY"
+
 
 def _recv_exact(sock: socket.socket, n: int, timeout: float | None) -> Optional[bytes]:
     """Read exactly n bytes or return None on EOF/timeout/error."""
@@ -137,6 +141,9 @@ class SyncUnixClient:
             idx = buf.index(b"\n")
             line = buf[:idx].decode("utf-8", errors="replace").strip()
             rest = bytes(buf[idx + 1 :])
+            if line == IMAGE_SNAPSHOT_GET_NOT_READY:
+                logger.debug("IMAGE_SNAPSHOT_GET: NOT_READY (PLC not RUNNING)")
+                return None
             if not line.startswith("IMAGE_SNAPSHOT_HDR:"):
                 logger.warning("IMAGE_SNAPSHOT_GET unexpected header: %s", line[:120])
                 return None
@@ -167,8 +174,12 @@ class SyncUnixClient:
                 pass
             return bytes(body)
 
-    def image_snapshot_set(self, payload: bytes, timeout: float = 5.0) -> bool:
-        """Apply full I/O image on plc_main (standby shadow execution)."""
+    def image_snapshot_set(self, payload: bytes, timeout: float = 5.0) -> tuple[bool, bool]:
+        """Apply full I/O image on plc_main (standby shadow execution).
+
+        Returns:
+            (success, not_ready): not_ready True when PLC is not RUNNING (safe to backoff).
+        """
         if not self.sock:
             raise RuntimeError("Socket not connected")
         if len(payload) != IMAGE_SNAPSHOT_EXPECTED_BYTES:
@@ -177,7 +188,7 @@ class SyncUnixClient:
                 len(payload),
                 IMAGE_SNAPSHOT_EXPECTED_BYTES,
             )
-            return False
+            return (False, False)
 
         hdr = (
             f"IMAGE_SNAPSHOT_SET:{IMAGE_SNAPSHOT_PROTOCOL_VERSION}:"
@@ -191,7 +202,7 @@ class SyncUnixClient:
                 self.sock.sendall(payload)
             except OSError as e:
                 logger.error("IMAGE_SNAPSHOT_SET send failed: %s", e)
-                return False
+                return (False, False)
 
             buf = bytearray()
             max_line = 512
@@ -199,15 +210,21 @@ class SyncUnixClient:
                 try:
                     chunk = self.sock.recv(4096)
                 except socket.timeout:
-                    return False
+                    return (False, False)
                 if not chunk:
-                    return False
+                    return (False, False)
                 buf.extend(chunk)
                 if b"\n" in buf:
                     break
             line_end = buf.index(b"\n")
             resp = buf[:line_end].decode("utf-8", errors="replace").strip()
-            return resp == "IMAGE_SNAPSHOT_SET:OK"
+            if resp == "IMAGE_SNAPSHOT_SET:OK":
+                return (True, False)
+            if resp == IMAGE_SNAPSHOT_SET_NOT_READY:
+                logger.debug("IMAGE_SNAPSHOT_SET: NOT_READY (PLC not RUNNING)")
+                return (False, True)
+            logger.warning("IMAGE_SNAPSHOT_SET unexpected response: %s", resp[:200])
+            return (False, False)
 
     def send_and_receive(self, msg: str, timeout: float = 0.5) -> Optional[str]:
         """

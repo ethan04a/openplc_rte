@@ -970,8 +970,10 @@ class RuntimeManager:
             logger.info("[热冗余][备机] TCP 心跳监听线程已退出。")
 
     def _redundancy_image_sync_master_loop(self) -> None:
-        return
-        """Push I/O snapshots to standby over TCP (redundancy NIC)."""
+        """Push I/O snapshots to standby over TCP (redundancy NIC).
+
+        Requires host plc_main RUNNING so IMAGE_SNAPSHOT_GET succeeds (same libplc as peer).
+        """
         standby_ip = self._redundancy_standby_ip
         if not standby_ip:
             logger.warning("[热冗余][主机] 未配置备机冗余 IP，跳过 I/O 镜像同步发送")
@@ -1000,7 +1002,7 @@ class RuntimeManager:
                         not payload
                         or len(payload) != IMAGE_SNAPSHOT_EXPECTED_BYTES
                     ):
-                        time.sleep(0.05)
+                        time.sleep(0.1)
                         continue
 
                     header = struct.pack(
@@ -1032,8 +1034,10 @@ class RuntimeManager:
             logger.info("[热冗余][主机] I/O 镜像同步发送线程已退出。")
 
     def _redundancy_image_sync_standby_loop(self) -> None:
-        return
-        """Receive I/O snapshots from master and apply via Unix socket."""
+        """Receive I/O snapshots from master and apply via Unix socket.
+
+        Applies only when local plc_main is RUNNING (process image pointers ready).
+        """
         local_ip = self._redundancy_local_ens35_ip
         master_ip = self._redundancy_master_ip
         if not local_ip or not master_ip:
@@ -1098,7 +1102,21 @@ class RuntimeManager:
                         if body is None or len(body) != ln:
                             break
                         try:
-                            self.runtime_socket.image_snapshot_set(body)
+                            if not self.runtime_socket.is_connected():
+                                self._safe_connect_runtime_socket()
+                            if not self._plc_runtime_is_running():
+                                time.sleep(0.15)
+                                continue
+                            ok, not_ready = self.runtime_socket.image_snapshot_set(body)
+                            if ok:
+                                continue
+                            if not_ready:
+                                time.sleep(0.15)
+                                continue
+                            logger.warning(
+                                "[热冗余][备机] I/O 镜像 SET 未接受，关闭 TCP 连接"
+                            )
+                            break
                         except (OSError, RuntimeError) as e:
                             logger.warning("[热冗余][备机] I/O 镜像 SET 失败: %s", e)
                             break
@@ -1210,6 +1228,17 @@ class RuntimeManager:
             logger.error("Failed to close runtime socket: %s", e)
         except Exception as e:
             logger.error("Failed to close runtime socket (unexpected): %s", e)
+
+    def _plc_runtime_is_running(self) -> bool:
+        """True if plc_main reports STATUS:RUNNING (I/O image tables safe for snapshot)."""
+        try:
+            self._safe_connect_runtime_socket()
+            if not self.runtime_socket.is_connected():
+                return False
+            status = self.runtime_socket.send_and_receive("STATUS\n", timeout=0.5)
+            return status == "STATUS:RUNNING"
+        except (OSError, RuntimeError, TypeError, ValueError):
+            return False
 
     def start(self):
         """
