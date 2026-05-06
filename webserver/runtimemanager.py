@@ -1110,17 +1110,20 @@ class RuntimeManager:
                         try:
                             if not self.runtime_socket.is_connected():
                                 self._safe_connect_runtime_socket()
+                            if not self._plc_shadow_standby:
+                                time.sleep(0.15)
+                                continue
                             if not self._plc_runtime_is_running():
                                 time.sleep(0.15)
                                 continue
-                            ok, not_ready = self.runtime_socket.image_snapshot_set(body)
+                            ok, defer = self.runtime_socket.image_snapshot_set(body)
                             if ok:
                                 continue
-                            if not_ready:
+                            if defer:
                                 time.sleep(0.15)
                                 continue
                             logger.warning(
-                                "[热冗余][备机] I/O 镜像 SET 未接受，关闭 TCP 连接"
+                                "[热冗余][备机] I/O 镜像 SET 失败，关闭 TCP 连接"
                             )
                             break
                         except (OSError, RuntimeError) as e:

@@ -285,7 +285,7 @@ void *unix_socket_thread(void *arg)
                                 MAX_RESPONSE_SIZE);
                         write_all(client_fd, response, strlen(response));
                     }
-                    else if (plc_get_state() != PLC_STATE_RUNNING)
+                    else
                     {
                         uint8_t *payload = malloc((size_t)sz);
 
@@ -295,20 +295,16 @@ void *unix_socket_thread(void *arg)
                             strncpy(response, "IMAGE_SNAPSHOT_SET:READ_ERROR\n", MAX_RESPONSE_SIZE);
                             write_all(client_fd, response, strlen(response));
                         }
-                        else
+                        else if (plc_get_state() != PLC_STATE_RUNNING)
                         {
                             free(payload);
                             strncpy(response, "IMAGE_SNAPSHOT_SET:NOT_READY\n", MAX_RESPONSE_SIZE);
                             write_all(client_fd, response, strlen(response));
                         }
-                    }
-                    else
-                    {
-                        uint8_t *payload = malloc(sz);
-                        if (!payload || read_exact(client_fd, payload, (size_t)sz) != 0)
+                        else if (!plugin_driver->shadow_standby)
                         {
                             free(payload);
-                            strncpy(response, "IMAGE_SNAPSHOT_SET:READ_ERROR\n", MAX_RESPONSE_SIZE);
+                            strncpy(response, "IMAGE_SNAPSHOT_SET:NOT_SHADOW\n", MAX_RESPONSE_SIZE);
                             write_all(client_fd, response, strlen(response));
                         }
                         else

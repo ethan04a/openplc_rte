@@ -15,6 +15,7 @@ IMAGE_SNAPSHOT_PROTOCOL_VERSION = 1
 # unix_socket.c refuses snapshot I/O when plc_main is not PLC_STATE_RUNNING
 IMAGE_SNAPSHOT_GET_NOT_READY = "IMAGE_SNAPSHOT_GET:NOT_READY"
 IMAGE_SNAPSHOT_SET_NOT_READY = "IMAGE_SNAPSHOT_SET:NOT_READY"
+IMAGE_SNAPSHOT_SET_NOT_SHADOW = "IMAGE_SNAPSHOT_SET:NOT_SHADOW"
 
 
 def _recv_exact(sock: socket.socket, n: int, timeout: float | None) -> Optional[bytes]:
@@ -185,7 +186,8 @@ class SyncUnixClient:
         """Apply full I/O image on plc_main (standby shadow execution).
 
         Returns:
-            (success, not_ready): not_ready True when PLC is not RUNNING (safe to backoff).
+            (success, defer): defer True when snapshot was skipped safely (NOT_READY or
+            NOT_SHADOW); keep redundancy TCP open and backoff. False defer = hard failure.
         """
         if not self.sock:
             raise RuntimeError("Socket not connected")
@@ -229,6 +231,9 @@ class SyncUnixClient:
                 return (True, False)
             if resp == IMAGE_SNAPSHOT_SET_NOT_READY:
                 logger.debug("IMAGE_SNAPSHOT_SET: NOT_READY (PLC not RUNNING)")
+                return (False, True)
+            if resp == IMAGE_SNAPSHOT_SET_NOT_SHADOW:
+                logger.debug("IMAGE_SNAPSHOT_SET: NOT_SHADOW (not shadow standby)")
                 return (False, True)
             logger.warning("IMAGE_SNAPSHOT_SET unexpected response: %s", resp[:200])
             return (False, False)
