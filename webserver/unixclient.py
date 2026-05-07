@@ -46,7 +46,22 @@ class SyncUnixClient:
         with mutex:
             if self.sock is None:
                 return False
-            return True
+            try:
+                # getpeername() raises if the stream is no longer connected.
+                self.sock.getpeername()
+                return True
+            except OSError:
+                self._invalidate_socket_locked()
+                return False
+
+    def _invalidate_socket_locked(self):
+        """Close and clear socket handle (mutex must already be held)."""
+        if self.sock is not None:
+            try:
+                self.sock.close()
+            except OSError:
+                pass
+            self.sock = None
 
     def connect(self):
         """Connect to the Unix socket server.
@@ -56,7 +71,11 @@ class SyncUnixClient:
         """
         with mutex:
             if self.sock is not None:
-                return
+                try:
+                    self.sock.getpeername()
+                    return
+                except OSError:
+                    self._invalidate_socket_locked()
             if not os.path.exists(self.socket_path):
                 raise FileNotFoundError(f"Socket not found: {self.socket_path}")
 
@@ -67,6 +86,7 @@ class SyncUnixClient:
                 self.sock.connect(self.socket_path)
                 logger.debug("Connected to server socket %s", self.socket_path)
             except Exception as e:
+                self._invalidate_socket_locked()
                 logger.error("Failed to connect: %s", e)
 
     def send_message(self, msg: str):
@@ -79,6 +99,7 @@ class SyncUnixClient:
                 self.sock.sendall(data)
                 # logger.info("Sent message: %s", data)
             except Exception as e:
+                self._invalidate_socket_locked()
                 logger.error("Error sending message: %s", e)
 
     def recv_message(self, timeout: float = 0.5) -> Optional[str]:
@@ -117,6 +138,7 @@ class SyncUnixClient:
                 logger.warning("Timeout waiting for message")
                 return None
             except Exception:
+                self._invalidate_socket_locked()
                 return None
 
     def image_snapshot_get(self, timeout: float = 3.0) -> Optional[bytes]:
@@ -129,6 +151,7 @@ class SyncUnixClient:
                 self.sock.settimeout(timeout)
                 self.sock.sendall(b"IMAGE_SNAPSHOT_GET\n")
             except OSError as e:
+                self._invalidate_socket_locked()
                 logger.error("IMAGE_SNAPSHOT_GET send failed: %s", e)
                 return None
 
@@ -141,6 +164,7 @@ class SyncUnixClient:
                     logger.warning("IMAGE_SNAPSHOT_GET header timeout")
                     return None
                 if not chunk:
+                    self._invalidate_socket_locked()
                     return None
                 buf.extend(chunk)
                 if b"\n" in buf:
@@ -175,6 +199,7 @@ class SyncUnixClient:
                 need = length - len(body)
                 extra = _recv_exact(self.sock, need, timeout)
                 if extra is None or len(extra) != need:
+                    self._invalidate_socket_locked()
                     return None
                 body = body + extra
             elif tail:
@@ -210,6 +235,7 @@ class SyncUnixClient:
                 self.sock.sendall(hdr)
                 self.sock.sendall(payload)
             except OSError as e:
+                self._invalidate_socket_locked()
                 logger.error("IMAGE_SNAPSHOT_SET send failed: %s", e)
                 return (False, False)
 
@@ -221,6 +247,7 @@ class SyncUnixClient:
                 except socket.timeout:
                     return (False, False)
                 if not chunk:
+                    self._invalidate_socket_locked()
                     return (False, False)
                 buf.extend(chunk)
                 if b"\n" in buf:
@@ -251,6 +278,7 @@ class SyncUnixClient:
             try:
                 self.sock.sendall(data)
             except Exception as e:
+                self._invalidate_socket_locked()
                 logger.error("Error sending message: %s", e)
                 return None
 
@@ -264,6 +292,7 @@ class SyncUnixClient:
                     if not chunk:
                         if buffer:
                             break
+                        self._invalidate_socket_locked()
                         return None
 
                     buffer.extend(chunk)
@@ -284,13 +313,11 @@ class SyncUnixClient:
                 logger.warning("Timeout waiting for message")
                 return None
             except Exception:
+                self._invalidate_socket_locked()
                 return None
 
     def close(self):
         with mutex:
             if self.sock:
                 logger.debug("Closing connection")
-                try:
-                    self.sock.close()
-                finally:
-                    self.sock = None
+                self._invalidate_socket_locked()
