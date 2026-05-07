@@ -402,7 +402,20 @@ class RuntimeManager:
                 "[热冗余][主机] TCP 心跳连接已建立，开始同步 redundancy_role.ini 第3–4行到备机 %s。",
                 standby_ip,
             )
-            push_role_ini_functional_to_standby(standby_ip, c33, c34, REDUNDANCY_SYNC_SECRET)
+            pushed = push_role_ini_functional_to_standby(
+                standby_ip, c33, c34, REDUNDANCY_SYNC_SECRET
+            )
+            if pushed:
+                ok_a = self._apply_ipv4_cidr_to_linux_interface(REDUNDANCY_FUNCTIONAL_NIC_A, c33)
+                ok_b = self._apply_ipv4_cidr_to_linux_interface(REDUNDANCY_FUNCTIONAL_NIC_B, c34)
+                if not ok_a or not ok_b:
+                    logger.warning(
+                        "[热冗余][主机] 同步成功后配置本机功能口部分失败: %s=%s, %s=%s",
+                        REDUNDANCY_FUNCTIONAL_NIC_A,
+                        ok_a,
+                        REDUNDANCY_FUNCTIONAL_NIC_B,
+                        ok_b,
+                    )
         except Exception as e:
             logger.error("[热冗余][主机] TCP 建连后同步第3–4行异常: %s", e)
 

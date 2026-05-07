@@ -124,7 +124,7 @@ def push_program_zip_to_standby(standby_ip: str, zip_path: Path, secret: str) ->
     logger.info("[热冗余] 已向备机 %s 推送程序并开始其编译流程（HTTP %s）", standby_ip, resp.status_code)
 
 
-def push_role_ini_functional_to_standby(standby_ip: str, line3: str, line4: str, secret: str) -> None:
+def push_role_ini_functional_to_standby(standby_ip: str, line3: str, line4: str, secret: str) -> bool:
     import urllib3
     import requests
 
@@ -143,8 +143,9 @@ def push_role_ini_functional_to_standby(standby_ip: str, line3: str, line4: str,
             resp.status_code,
             resp.text[:500],
         )
-        return
+        return False
     logger.info("[热冗余] 已向备机 %s 同步 redundancy_role.ini 第3–4行（HTTP %s）", standby_ip, resp.status_code)
+    return True
 
 
 def schedule_master_to_standby_sync(runtime_manager: RuntimeManager) -> None:
