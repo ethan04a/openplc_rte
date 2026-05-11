@@ -532,14 +532,11 @@ class RuntimeManager:
             t.join(timeout=3)
         self._heartbeat_threads.clear()
 
-    def _redundancy_ping_master_reachable(self) -> bool:
-        """ICMP ping configured master IPv4 once (Linux iputils ping)."""
-        master_ip = self._redundancy_master_ip
-        if not master_ip:
-            return False
+    def _redundancy_ping_master_ipv4_once(self, ip: str) -> bool:
+        """单次 ICMP ping（Linux iputils），成功返回 True。"""
         try:
             proc = subprocess.run(
-                ["ping", "-c", "1", "-W", "2", master_ip],
+                ["ping", "-c", "1", "-W", "2", ip],
                 capture_output=True,
                 text=True,
                 timeout=8,
@@ -548,6 +545,56 @@ class RuntimeManager:
             return proc.returncode == 0
         except (OSError, subprocess.TimeoutExpired):
             return False
+
+    def _redundancy_ping_master_reachable(self) -> bool:
+        """
+        分别 ping 主机两条功能网口在 ini 中的 IPv4（第 3、4 行），不用冗余心跳口 IP。
+        只要有一条功能 IP 能 ping 通即视为主机仍可达；两条均无响应则判定为故障（返回 False）。
+        """
+        ini_path = self._openplc_project_root() / REDUNDANCY_ROLE_FILENAME
+        c33, c34 = self._read_functional_cidr_from_ini(ini_path)
+
+        targets: list[tuple[str, str]] = []
+        if c33:
+            targets.append(
+                (REDUNDANCY_FUNCTIONAL_NIC_A, str(ipaddress.IPv4Interface(c33).ip))
+            )
+        if c34:
+            targets.append(
+                (REDUNDANCY_FUNCTIONAL_NIC_B, str(ipaddress.IPv4Interface(c34).ip))
+            )
+
+        if not targets:
+            logger.warning(
+                "[热冗余][备机] 故障探测：无法从 %s 读取主机功能 IPv4（第 3、4 行），"
+                "无法进行 ping，按主机不可达处理。",
+                ini_path,
+            )
+            return False
+
+        any_ok = False
+        for nic_name, ip in targets:
+            ok = self._redundancy_ping_master_ipv4_once(ip)
+            if ok:
+                logger.info(
+                    "[热冗余][备机] 故障探测：接口 %s 对应地址 %s 可达。",
+                    nic_name,
+                    ip,
+                )
+                any_ok = True
+            else:
+                logger.info(
+                    "[热冗余][备机] 故障探测：接口 %s 对应地址 %s 不可达。",
+                    nic_name,
+                    ip,
+                )
+
+        if any_ok:
+            return True
+        logger.info(
+            "[热冗余][备机] 故障探测：所有已配置的主机功能地址均无 ICMP 响应，判定为故障。"
+        )
+        return False
 
     def _redundancy_trigger_standby_to_master_switch(self) -> None:
         """
@@ -726,7 +773,7 @@ class RuntimeManager:
             return lost_times, False
         if self._redundancy_ping_master_reachable():
             logger.info(
-                "[热冗余][备机] LostTimes=%d 已超过阈值 %d 秒但 ping 主机可达，清零计数。",
+                "[热冗余][备机] LostTimes=%d 已超过阈值 %d 秒，但主机功能口仍有可达地址，清零计数。",
                 lost_times,
                 REDUNDANCY_STANDBY_LOST_THRESHOLD_SEC,
             )
@@ -952,6 +999,7 @@ class RuntimeManager:
                             chunk = client.recv(4096)
                         except (TimeoutError, socket.timeout):
                             lost_times += 1
+                            logger.info("[热冗余][备机] 接收 TCP 数据超时，LostTimes 增加到 %d", lost_times)
                             lost_times, switched = self._standby_tick_lost_times(lost_times)
                             if switched:
                                 break
