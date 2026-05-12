@@ -19,12 +19,9 @@ from webserver.plcapp_management import (
     apply_program_zip_upload,
     build_state,
 )
+from webserver.redundancy_role_config import REDUNDANCY_ROLE_FILENAME, write_redundancy_role_functional_cidrs
 from webserver.restapi import restapi_bp
-from webserver.runtimemanager import (
-    REDUNDANCY_ROLE_FILENAME,
-    REDUNDANCY_SYNC_SECRET,
-    RuntimeManager,
-)
+from webserver.runtimemanager import REDUNDANCY_SYNC_SECRET, RuntimeManager
 
 logger, _ = get_logger("runtime", use_buffer=True)
 
@@ -78,12 +75,17 @@ def register_redundancy_sync_routes(runtime_manager: RuntimeManager) -> None:
             ipaddress.IPv4Interface(line4)
         except ValueError:
             return jsonify({"error": "line3 and line4 must be IPv4/prefix"}), 400
-        ini_path = RuntimeManager._openplc_project_root() / REDUNDANCY_ROLE_FILENAME
+        role_json_path = RuntimeManager._openplc_project_root() / REDUNDANCY_ROLE_FILENAME
         try:
-            RuntimeManager.write_redundancy_ini_functional_lines(ini_path, line3, line4)
+            write_redundancy_role_functional_cidrs(role_json_path, line3, line4)
         except OSError as e:
             return jsonify({"error": str(e)}), 500
-        logger.info("[热冗余] 已接收主机同步的 redundancy_role.ini 功能行: %s, %s", line3, line4)
+        logger.info(
+            "[热冗余] 已接收主机同步的 %s 中 permanent_master_functional_*: %s, %s",
+            REDUNDANCY_ROLE_FILENAME,
+            line3,
+            line4,
+        )
         return jsonify({"ok": True}), 200
 
 
@@ -139,12 +141,18 @@ def push_role_ini_functional_to_standby(standby_ip: str, line3: str, line4: str,
     )
     if resp.status_code >= 400:
         logger.error(
-            "[热冗余] 同步 redundancy_role.ini 功能行至备机失败: HTTP %s %s",
+            "[热冗余] 同步 %s 中 permanent_master_functional_* 至备机失败: HTTP %s %s",
+            REDUNDANCY_ROLE_FILENAME,
             resp.status_code,
             resp.text[:500],
         )
         return False
-    logger.info("[热冗余] 已向备机 %s 同步 redundancy_role.ini 第3–4行（HTTP %s）", standby_ip, resp.status_code)
+    logger.info(
+        "[热冗余] 已向备机 %s 同步 %s 中 permanent_master_functional_*（HTTP %s）",
+        standby_ip,
+        REDUNDANCY_ROLE_FILENAME,
+        resp.status_code,
+    )
     return True
 
 
