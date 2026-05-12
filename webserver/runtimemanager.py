@@ -999,7 +999,8 @@ class RuntimeManager:
                             chunk = client.recv(4096)
                         except (TimeoutError, socket.timeout):
                             lost_times += 1
-                            logger.info("[热冗余][备机] 接收 TCP 数据超时，LostTimes 增加到 %d", lost_times)
+                            if lost_times > REDUNDANCY_STANDBY_LOST_THRESHOLD_SEC:
+                                logger.info("[热冗余][备机] LostTimes 增加到 %d", lost_times)
                             lost_times, switched = self._standby_tick_lost_times(lost_times)
                             if switched:
                                 break
