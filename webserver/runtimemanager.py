@@ -471,9 +471,18 @@ class RuntimeManager:
             self._functional_lines_pending_sync = None
 
     def _sync_functional_lines_after_tcp_connect(
-        self, heartbeat_sock: socket.socket | None = None
+        self,
+        heartbeat_sock: socket.socket | None = None,
+        *,
+        sync_attempt_kind: str = "on_connect",
     ) -> None:
-        """主机 TCP 心跳连上备机后，同步 functional_nics permanent_master 到备机。"""
+        """
+        同步 functional_nics permanent_master 到备机（冗余 TCP 优先，失败则 HTTPS）。
+
+        sync_attempt_kind:
+        - on_connect: TCP connect() 成功后立刻调用（pending 可能尚未由记录线程填充）。
+        - periodic: 每次发送心跳前调用，消除与 _record_functional_ips_and_sync_standby_thread 的竞态。
+        """
         standby_ip = self._redundancy_standby_ip
         if not standby_ip:
             return
@@ -483,12 +492,19 @@ class RuntimeManager:
             return
 
         cidrs = list(pending)
-        logger.info(
-            "[热冗余][主机] TCP 心跳连接已建立，开始同步 %s 中 %d 个 functional_nics permanent_master 到备机 %s。",
-            REDUNDANCY_ROLE_FILENAME,
-            len(cidrs),
-            standby_ip,
-        )
+        if sync_attempt_kind == "on_connect":
+            logger.info(
+                "[热冗余][主机] TCP 心跳连接已建立，开始同步 %s 中 %d 个 functional_nics permanent_master 到备机 %s。",
+                REDUNDANCY_ROLE_FILENAME,
+                len(cidrs),
+                standby_ip,
+            )
+        else:
+            logger.debug(
+                "[热冗余][主机] 心跳周期补发：向备机 %s 同步 %d 个 functional_nics permanent_master",
+                standby_ip,
+                len(cidrs),
+            )
 
         if heartbeat_sock is not None and self._push_functional_cidrs_over_heartbeat_tcp(
             heartbeat_sock, cidrs
@@ -988,7 +1004,7 @@ class RuntimeManager:
                     sock.bind((local_ip, 0))
                     sock.settimeout(10.0)
                     sock.connect((peer_ip, REDUNDANCY_HEARTBEAT_PORT))
-                    self._sync_functional_lines_after_tcp_connect(sock)
+                    self._sync_functional_lines_after_tcp_connect(sock, sync_attempt_kind="on_connect")
                 except OSError as e:
                     logger.warning(
                         "[热冗余][主机] 连接对端 TCP %s:%d 失败，将在 %.1f 秒后重试: %s",
@@ -1006,6 +1022,8 @@ class RuntimeManager:
                     if self._heartbeat_stop.wait(REDUNDANCY_MASTER_HEARTBEAT_INTERVAL_SEC):
                         break
                     continue
+
+            self._sync_functional_lines_after_tcp_connect(sock, sync_attempt_kind="periodic")
 
             try:
                 sock.sendall(REDUNDANCY_HB_PAYLOAD)
