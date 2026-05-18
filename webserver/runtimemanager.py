@@ -187,20 +187,20 @@ class RuntimeManager:
     @staticmethod
     def _ipv4_for_interface(ifname: str) -> str | None:
         """Return IPv4 address on interface ifname (exact label match), or None."""
+        # Prefer ip(8) with per-address label (eth2:1 vs eth2:3) over psutil's first IPv4.
+        out = RuntimeManager._run_ip_addr_show(ifname)
+        if out is not None:
+            cidr = RuntimeManager._ipv4_cidr_from_ip_addr_show_output(out, ifname)
+            if cidr is not None:
+                return str(ipaddress.IPv4Interface(cidr).ip)
+
         if HAS_PSUTIL and psutil is not None:
             addrs = psutil.net_if_addrs().get(ifname)
             if addrs is not None:
                 for entry in addrs:
                     if entry.family == socket.AF_INET and entry.address:
                         return str(entry.address)
-
-        out = RuntimeManager._run_ip_addr_show(ifname)
-        if out is None:
-            return None
-        cidr = RuntimeManager._ipv4_cidr_from_ip_addr_show_output(out, ifname)
-        if cidr is None:
-            return None
-        return str(ipaddress.IPv4Interface(cidr).ip)
+        return None
 
     @staticmethod
     def _ipv4_cidr_for_interface(ifname: str) -> str | None:
@@ -1007,13 +1007,21 @@ class RuntimeManager:
         Requires host plc_main RUNNING so IMAGE_SNAPSHOT_GET succeeds (same libplc as peer).
         """
         standby_ip = self._redundancy_standby_ip
+        local_ip = self._redundancy_local_heartbeat_ip
         if not standby_ip:
             logger.warning("[热冗余][主机] 未配置备机冗余 IP，跳过 I/O 镜像同步发送")
+            return
+        if not local_ip:
+            logger.warning(
+                "[热冗余][主机] 冗余心跳网卡 %s 地址未就绪，跳过 I/O 镜像同步发送",
+                self._redundancy_heartbeat_nic,
+            )
             return
 
         sock: socket.socket | None = None
         logger.info(
-            "[热冗余][主机] I/O 镜像同步发送线程启动 → %s:%s",
+            "[热冗余][主机] I/O 镜像同步发送线程启动（本机源地址=%s）→ %s:%s",
+            local_ip,
             standby_ip,
             REDUNDANCY_IMAGE_SYNC_PORT,
         )
@@ -1024,6 +1032,8 @@ class RuntimeManager:
                 try:
                     if sock is None:
                         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                        sock.bind((local_ip, 0))
                         sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
                         sock.settimeout(5.0)
                         sock.connect((standby_ip, REDUNDANCY_IMAGE_SYNC_PORT))
