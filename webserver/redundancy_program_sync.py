@@ -68,23 +68,47 @@ def register_redundancy_sync_routes(runtime_manager: RuntimeManager) -> None:
         if request.headers.get("X-OpenPLC-Redundancy-Sync") != REDUNDANCY_SYNC_SECRET:
             return jsonify({"error": "forbidden"}), 403
         data = request.get_json(silent=True) or {}
-        line3 = str(data.get("line3", "")).strip()
-        line4 = str(data.get("line4", "")).strip()
+        cidrs_raw = data.get("permanent_master_ipv4_cidrs")
+        cidrs: list[str] = []
+        if isinstance(cidrs_raw, list):
+            cidrs = [str(c).strip() for c in cidrs_raw if str(c).strip()]
+        elif data.get("line3") or data.get("line4"):
+            # Legacy body from older masters (exactly two CIDRs)
+            for key in ("line3", "line4"):
+                val = str(data.get(key, "")).strip()
+                if val:
+                    cidrs.append(val)
+        if not cidrs:
+            return jsonify(
+                {"error": "permanent_master_ipv4_cidrs must be a non-empty array of IPv4/prefix"}
+            ), 400
         try:
-            ipaddress.IPv4Interface(line3)
-            ipaddress.IPv4Interface(line4)
+            for cidr in cidrs:
+                ipaddress.IPv4Interface(cidr)
         except ValueError:
-            return jsonify({"error": "line3 and line4 must be IPv4/prefix"}), 400
+            return jsonify(
+                {"error": "permanent_master_ipv4_cidrs (or line3/line4) must be valid IPv4/prefix values"}
+            ), 400
         role_json_path = RuntimeManager._openplc_project_root() / REDUNDANCY_ROLE_FILENAME
         try:
-            write_redundancy_role_functional_cidrs(role_json_path, line3, line4)
+            written = write_redundancy_role_functional_cidrs(role_json_path, cidrs)
         except OSError as e:
             return jsonify({"error": str(e)}), 500
+        if not written:
+            return jsonify(
+                {
+                    "error": (
+                        "failed to write permanent_master_ipv4_cidr: "
+                        "redundancy_role.json missing, empty functional_nics, or "
+                        "CIDR count/order mismatch with master"
+                    )
+                }
+            ), 409
+        runtime_manager.reload_functional_nics_from_disk()
         logger.info(
-            "[热冗余] 已接收主机同步的 %s 中 permanent_master_functional_*: %s, %s",
+            "[热冗余] 已接收主机同步的 %s functional_nics permanent_master (%d 项)",
             REDUNDANCY_ROLE_FILENAME,
-            line3,
-            line4,
+            len(cidrs),
         )
         return jsonify({"ok": True}), 200
 
@@ -126,7 +150,9 @@ def push_program_zip_to_standby(standby_ip: str, zip_path: Path, secret: str) ->
     logger.info("[热冗余] 已向备机 %s 推送程序并开始其编译流程（HTTP %s）", standby_ip, resp.status_code)
 
 
-def push_role_ini_functional_to_standby(standby_ip: str, line3: str, line4: str, secret: str) -> bool:
+def push_role_ini_functional_to_standby(
+    standby_ip: str, permanent_master_cidrs: list[str], secret: str
+) -> bool:
     import urllib3
     import requests
 
@@ -135,20 +161,20 @@ def push_role_ini_functional_to_standby(standby_ip: str, line3: str, line4: str,
     resp = requests.post(
         url,
         headers={"X-OpenPLC-Redundancy-Sync": secret, "Content-Type": "application/json"},
-        json={"line3": line3, "line4": line4},
+        json={"permanent_master_ipv4_cidrs": permanent_master_cidrs},
         verify=False,
         timeout=60,
     )
     if resp.status_code >= 400:
         logger.error(
-            "[热冗余] 同步 %s 中 permanent_master_functional_* 至备机失败: HTTP %s %s",
+            "[热冗余] 同步 %s functional_nics permanent_master 至备机失败: HTTP %s %s",
             REDUNDANCY_ROLE_FILENAME,
             resp.status_code,
             resp.text[:500],
         )
         return False
     logger.info(
-        "[热冗余] 已向备机 %s 同步 %s 中 permanent_master_functional_*（HTTP %s）",
+        "[热冗余] 已向备机 %s 同步 %s functional_nics permanent_master（HTTP %s）",
         standby_ip,
         REDUNDANCY_ROLE_FILENAME,
         resp.status_code,

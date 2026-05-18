@@ -1,13 +1,24 @@
 {
-  "about": "Hot-redundancy role and addressing for this OpenPLC pair. Peer IPv4s must match the IPv4 on the interface named redundancy_heartbeat_nic_linux_ifname. functional_io_nic_*_linux_ifname: interfaces used for permanent_master_functional_* CIDR fields and for standby backup addresses. Omitted or invalid NIC names fall back to ens35 / ens33 / ens34.",
-  "schema_version": 1,
-  "redundancy_heartbeat_nic_linux_ifname": "ens35",
-  "functional_io_nic_a_linux_ifname": "ens33",
-  "functional_io_nic_b_linux_ifname": "ens34",
-  "master_ipv4_on_redundancy_heartbeat_nic": "192.168.200.10",
-  "standby_ipv4_on_redundancy_heartbeat_nic": "192.168.200.20",
-  "permanent_master_functional_nic_a_ipv4_cidr": "192.168.1.206/24",
-  "permanent_master_functional_nic_b_ipv4_cidr": "192.168.100.10/24",
-  "standby_backup_functional_nic_a_ipv4_cidr_before_takeover": "",
-  "standby_backup_functional_nic_b_ipv4_cidr_before_takeover": ""
+  "about": "Hot-redundancy role and addressing for this OpenPLC pair. Peer IPv4s must match the IPv4 on redundancy_heartbeat_nic_linux_ifname. functional_nics: array of 0..N objects (linux_ifname, permanent_master_ipv4_cidr, standby_backup_ipv4_cidr_before_takeover).",
+  "schema_version": 2,
+  "redundancy_heartbeat_nic_linux_ifname": "eth2:3",
+  "functional_nics": [
+    {
+      "linux_ifname": "eth1",
+      "permanent_master_ipv4_cidr": "192.168.1.206/24",
+      "standby_backup_ipv4_cidr_before_takeover": ""
+    },
+    {
+      "linux_ifname": "eth2:1",
+      "permanent_master_ipv4_cidr": "192.168.100.10/24",
+      "standby_backup_ipv4_cidr_before_takeover": ""
+    },
+    {
+      "linux_ifname": "eth2:2",
+      "permanent_master_ipv4_cidr": "192.168.100.11/24",
+      "standby_backup_ipv4_cidr_before_takeover": ""
+    }
+  ],
+  "master_ipv4_on_redundancy_heartbeat_nic": "192.168.100.12",
+  "standby_ipv4_on_redundancy_heartbeat_nic": "192.168.200.20"
 }

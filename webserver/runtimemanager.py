@@ -18,21 +18,18 @@ except ImportError:
 
 from webserver.logger import get_logger
 from webserver.redundancy_role_config import (
-    DEFAULT_FUNCTIONAL_IO_NIC_A_LINUX_IFNAME,
-    DEFAULT_FUNCTIONAL_IO_NIC_B_LINUX_IFNAME,
     DEFAULT_REDUNDANCY_HEARTBEAT_NIC_LINUX_IFNAME,
+    FunctionalNicRole,
     REDUNDANCY_ROLE_FILENAME,
+    REDUNDANCY_ROLE_KEY_FUNCTIONAL_NICS,
     REDUNDANCY_ROLE_KEY_MASTER_REDUNDANCY_IPV4,
-    REDUNDANCY_ROLE_KEY_PERMANENT_MASTER_FUNCTIONAL_A_CIDR,
-    REDUNDANCY_ROLE_KEY_PERMANENT_MASTER_FUNCTIONAL_B_CIDR,
-    REDUNDANCY_ROLE_KEY_STANDBY_BACKUP_FUNCTIONAL_A_CIDR,
-    REDUNDANCY_ROLE_KEY_STANDBY_BACKUP_FUNCTIONAL_B_CIDR,
     REDUNDANCY_ROLE_KEY_STANDBY_REDUNDANCY_IPV4,
+    functional_nics_from_role_document,
     load_redundancy_role_document,
-    nic_interface_names_from_role_document,
     peer_ipv4s_from_role_document,
     read_functional_cidrs_for_project,
     read_standby_backup_cidrs_for_project,
+    redundancy_heartbeat_nic_from_role_document,
     write_redundancy_role_functional_cidrs,
     write_redundancy_role_standby_backup_cidrs,
 )
@@ -103,15 +100,14 @@ class RuntimeManager:
         self._crash_times: list[float] = []
         self._safe_mode = False
 
-        # Hot redundancy: interface names from redundancy_role.json (defaults until _evaluate_redundancy_role)
+        # Hot redundancy: from redundancy_role.json (defaults until _evaluate_redundancy_role)
         self._redundancy_heartbeat_nic = DEFAULT_REDUNDANCY_HEARTBEAT_NIC_LINUX_IFNAME
-        self._redundancy_functional_nic_a = DEFAULT_FUNCTIONAL_IO_NIC_A_LINUX_IFNAME
-        self._redundancy_functional_nic_b = DEFAULT_FUNCTIONAL_IO_NIC_B_LINUX_IFNAME
+        self._redundancy_functional_nics: list[FunctionalNicRole] = []
         self.is_master = False
         self.is_redundancy = False
         self._redundancy_master_ip: str | None = None
         self._redundancy_standby_ip: str | None = None
-        self._redundancy_local_ens35_ip: str | None = None
+        self._redundancy_local_heartbeat_ip: str | None = None
         self._heartbeat_stop = threading.Event()
         self._heartbeat_threads: list[threading.Thread] = []
         # 备机暂时升主后为 True；升主后仍监听冗余口，收到原主机心跳载荷则异步回切
@@ -122,8 +118,8 @@ class RuntimeManager:
         self._promoted_standby_acting_master = False
         # 备升主过程中避免 monitor 线程误重启 PLC
         self._manual_plc_restart_in_progress = False
-        # 主机本地记录完成后，等待“TCP 心跳已连接备机”时再同步 permanent_master_functional_* 到备机
-        self._functional_lines_pending_sync: tuple[str, str] | None = None
+        # 主机本地记录完成后，等待“TCP 心跳已连接备机”时再同步 functional_nics 中 permanent_master_* 到备机
+        self._functional_lines_pending_sync: list[str] | None = None
         self._functional_sync_lock = threading.Lock()
         self._plc_status_cache_lock = threading.Lock()
         self._plc_status_cache_monotonic: float = 0.0
@@ -135,35 +131,51 @@ class RuntimeManager:
         return Path(__file__).resolve().parent.parent
 
     @staticmethod
-    def _ipv4_for_interface(ifname: str) -> str | None:
-        """Return first IPv4 address on interface ifname, or None."""
-        if HAS_PSUTIL and psutil is not None:
-            addrs = psutil.net_if_addrs().get(ifname)
-            if addrs:
-                for entry in addrs:
-                    if entry.family == socket.AF_INET and entry.address:
-                        return str(entry.address)
+    def _format_functional_nic_names_for_log(functional_nics: list[FunctionalNicRole]) -> str:
+        if not functional_nics:
+            return "(无)"
+        return ", ".join(entry.linux_ifname for entry in functional_nics)
+
+    @staticmethod
+    def _parse_ip_o_addr_line(line: str) -> tuple[str | None, str | None]:
+        """
+        Parse one line of `ip -4 -o addr show` output.
+
+        Returns (ipv4_cidr, label) where label is the address label on the line
+        (last token, e.g. eth0:2). When one physical NIC has several IPv4 aliases,
+        each line has a distinct label; callers must match label to the requested ifname.
+        """
+        stripped = line.strip()
+        if not stripped:
+            return None, None
+        parts = stripped.split()
         try:
-            out = subprocess.check_output(
-                ["ip", "-4", "-o", "addr", "show", "dev", ifname],
-                stderr=subprocess.DEVNULL,
-                text=True,
-                timeout=5,
-            )
-        except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
-            return None
+            inet_idx = parts.index("inet")
+        except ValueError:
+            return None, None
+        if inet_idx + 1 >= len(parts):
+            return None, None
+        cidr = parts[inet_idx + 1].strip()
+        label = parts[-1].rstrip("\\")
+        return cidr, label
+
+    @staticmethod
+    def _ipv4_cidr_from_ip_addr_show_output(out: str, ifname: str) -> str | None:
+        """Pick the IPv4 CIDR on the line whose label exactly equals ifname."""
         for line in out.splitlines():
-            parts = line.split()
-            for i, token in enumerate(parts):
-                if token == "inet" and i + 1 < len(parts):
-                    return parts[i + 1].split("/")[0].strip()
+            cidr, label = RuntimeManager._parse_ip_o_addr_line(line)
+            if not cidr or label != ifname:
+                continue
+            try:
+                return str(ipaddress.IPv4Interface(cidr))
+            except ValueError:
+                continue
         return None
 
     @staticmethod
-    def _ipv4_cidr_for_interface(ifname: str) -> str | None:
-        """First IPv4 address on ifname as 'a.b.c.d/prefix', or None."""
+    def _run_ip_addr_show(ifname: str) -> str | None:
         try:
-            out = subprocess.check_output(
+            return subprocess.check_output(
                 ["ip", "-4", "-o", "addr", "show", "dev", ifname],
                 stderr=subprocess.DEVNULL,
                 text=True,
@@ -171,16 +183,32 @@ class RuntimeManager:
             )
         except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
             return None
-        for line in out.splitlines():
-            parts = line.split()
-            for i, token in enumerate(parts):
-                if token == "inet" and i + 1 < len(parts):
-                    cidr = parts[i + 1].strip()
-                    try:
-                        return str(ipaddress.IPv4Interface(cidr))
-                    except ValueError:
-                        continue
-        return None
+
+    @staticmethod
+    def _ipv4_for_interface(ifname: str) -> str | None:
+        """Return IPv4 address on interface ifname (exact label match), or None."""
+        if HAS_PSUTIL and psutil is not None:
+            addrs = psutil.net_if_addrs().get(ifname)
+            if addrs is not None:
+                for entry in addrs:
+                    if entry.family == socket.AF_INET and entry.address:
+                        return str(entry.address)
+
+        out = RuntimeManager._run_ip_addr_show(ifname)
+        if out is None:
+            return None
+        cidr = RuntimeManager._ipv4_cidr_from_ip_addr_show_output(out, ifname)
+        if cidr is None:
+            return None
+        return str(ipaddress.IPv4Interface(cidr).ip)
+
+    @staticmethod
+    def _ipv4_cidr_for_interface(ifname: str) -> str | None:
+        """Return IPv4 CIDR on ifname (exact label match), or None."""
+        out = RuntimeManager._run_ip_addr_show(ifname)
+        if out is None:
+            return None
+        return RuntimeManager._ipv4_cidr_from_ip_addr_show_output(out, ifname)
 
     @staticmethod
     def _apply_ipv4_cidr_to_linux_interface(ifname: str, cidr: str) -> bool:
@@ -222,44 +250,46 @@ class RuntimeManager:
             return False
 
     def _record_functional_ips_and_sync_standby_thread(self) -> None:
-        """主机：将 JSON 配置的功能口网卡 IPv4/掩码写入 permanent_master_functional_*。"""
+        """主机：将各功能口网卡 IPv4/掩码写入 functional_nics[].permanent_master_ipv4_cidr。"""
         try:
+            if not self._redundancy_functional_nics:
+                logger.info("[热冗余] 未配置功能网卡，跳过功能 IP 记录。")
+                return
             project_root = self._openplc_project_root()
             role_json_path = project_root / REDUNDANCY_ROLE_FILENAME
             if not role_json_path.is_file():
                 return
-            c33 = self._ipv4_cidr_for_interface(self._redundancy_functional_nic_a)
-            c34 = self._ipv4_cidr_for_interface(self._redundancy_functional_nic_b)
-            if not c33 or not c34:
-                logger.warning(
-                    "[热冗余] 功能 IP 记录跳过：%s=%s, %s=%s（需两网卡均有 IPv4）",
-                    self._redundancy_functional_nic_a,
-                    c33,
-                    self._redundancy_functional_nic_b,
-                    c34,
-                )
-                return
-            write_redundancy_role_functional_cidrs(role_json_path, c33, c34)
+            recorded: list[str] = []
+            for entry in self._redundancy_functional_nics:
+                cidr = self._ipv4_cidr_for_interface(entry.linux_ifname)
+                if not cidr:
+                    logger.warning(
+                        "[热冗余] 功能 IP 记录跳过：网卡 %s 无 IPv4（需所有已配置功能网卡均有地址）",
+                        entry.linux_ifname,
+                    )
+                    return
+                recorded.append(cidr)
+            write_redundancy_role_functional_cidrs(role_json_path, recorded)
+            pairs = ", ".join(
+                f"{e.linux_ifname}={c}" for e, c in zip(self._redundancy_functional_nics, recorded)
+            )
             logger.info(
-                "[热冗余] 已记录功能口地址到 %s 字段 %s/%s: %s=%s, %s=%s",
+                "[热冗余] 已记录 %d 个功能口地址到 %s.%s: %s",
+                len(recorded),
                 role_json_path,
-                REDUNDANCY_ROLE_KEY_PERMANENT_MASTER_FUNCTIONAL_A_CIDR,
-                REDUNDANCY_ROLE_KEY_PERMANENT_MASTER_FUNCTIONAL_B_CIDR,
-                self._redundancy_functional_nic_a,
-                c33,
-                self._redundancy_functional_nic_b,
-                c34,
+                REDUNDANCY_ROLE_KEY_FUNCTIONAL_NICS,
+                pairs,
             )
             with self._functional_sync_lock:
-                self._functional_lines_pending_sync = (c33, c34)
+                self._functional_lines_pending_sync = list(recorded)
             logger.info(
-                "[热冗余] permanent_master_functional_* 已标记待同步，等待主备 TCP 心跳连接建立后再推送。"
+                "[热冗余] functional_nics permanent_master 已标记待同步，等待主备 TCP 心跳连接建立后再推送。"
             )
         except Exception as e:
             logger.error("[热冗余] 功能 IP 记录异常: %s", e)
 
     def _sync_functional_lines_after_tcp_connect(self) -> None:
-        """主机 TCP 心跳连上备机后，再尝试同步 redundancy_role.json 的 permanent_master_functional_* 到备机。"""
+        """主机 TCP 心跳连上备机后，再尝试同步 redundancy_role.json 的 functional_nics 到备机。"""
         standby_ip = self._redundancy_standby_ip
         if not standby_ip:
             return
@@ -268,31 +298,28 @@ class RuntimeManager:
         if not pending:
             return
 
-        c33, c34 = pending
+        cidrs = pending
         try:
             from webserver.redundancy_program_sync import push_role_ini_functional_to_standby
 
             logger.info(
-                "[热冗余][主机] TCP 心跳连接已建立，开始同步 %s 中 permanent_master_functional_* 到备机 %s。",
+                "[热冗余][主机] TCP 心跳连接已建立，开始同步 %s 中 %d 个 functional_nics permanent_master 到备机 %s。",
                 REDUNDANCY_ROLE_FILENAME,
+                len(cidrs),
                 standby_ip,
             )
             pushed = push_role_ini_functional_to_standby(
-                standby_ip, c33, c34, REDUNDANCY_SYNC_SECRET
+                standby_ip, cidrs, REDUNDANCY_SYNC_SECRET
             )
             if pushed:
-                ok_a = self._apply_ipv4_cidr_to_linux_interface(self._redundancy_functional_nic_a, c33)
-                ok_b = self._apply_ipv4_cidr_to_linux_interface(self._redundancy_functional_nic_b, c34)
-                if not ok_a or not ok_b:
-                    logger.warning(
-                        "[热冗余][主机] 同步成功后配置本机功能口部分失败: %s=%s, %s=%s",
-                        self._redundancy_functional_nic_a,
-                        ok_a,
-                        self._redundancy_functional_nic_b,
-                        ok_b,
-                    )
+                for entry, cidr in zip(self._redundancy_functional_nics, cidrs):
+                    if not self._apply_ipv4_cidr_to_linux_interface(entry.linux_ifname, cidr):
+                        logger.warning(
+                            "[热冗余][主机] 同步成功后配置本机功能口 %s 失败",
+                            entry.linux_ifname,
+                        )
         except Exception as e:
-            logger.error("[热冗余][主机] TCP 建连后同步 permanent_master_functional_* 异常: %s", e)
+            logger.error("[热冗余][主机] TCP 建连后同步 functional_nics 异常: %s", e)
 
     def _evaluate_redundancy_role(self) -> None:
         """
@@ -303,12 +330,11 @@ class RuntimeManager:
         self.is_redundancy = False
         self._redundancy_master_ip = None
         self._redundancy_standby_ip = None
-        self._redundancy_local_ens35_ip = None
+        self._redundancy_local_heartbeat_ip = None
         self._plc_shadow_standby = False
         self._promoted_standby_acting_master = False
         self._redundancy_heartbeat_nic = DEFAULT_REDUNDANCY_HEARTBEAT_NIC_LINUX_IFNAME
-        self._redundancy_functional_nic_a = DEFAULT_FUNCTIONAL_IO_NIC_A_LINUX_IFNAME
-        self._redundancy_functional_nic_b = DEFAULT_FUNCTIONAL_IO_NIC_B_LINUX_IFNAME
+        self._redundancy_functional_nics = []
 
         project_root = self._openplc_project_root()
         role_json_path = project_root / REDUNDANCY_ROLE_FILENAME
@@ -327,18 +353,17 @@ class RuntimeManager:
             )
             return
 
-        hb_nic, fa_nic, fb_nic = nic_interface_names_from_role_document(doc)
-        self._redundancy_heartbeat_nic = hb_nic
-        self._redundancy_functional_nic_a = fa_nic
-        self._redundancy_functional_nic_b = fb_nic
+        self._redundancy_heartbeat_nic = redundancy_heartbeat_nic_from_role_document(doc)
+        self._redundancy_functional_nics = functional_nics_from_role_document(doc)
+        fnic_log = self._format_functional_nic_names_for_log(self._redundancy_functional_nics)
         logger.info(
-            "[热冗余] 开始冗余角色检测: 项目根目录=%s, 配置文件=%s；已从 JSON 解析网卡名 "
-            "（无效或缺失字段时使用默认）: 冗余心跳=%s, 功能口A=%s, 功能口B=%s",
+            "[热冗余] 开始冗余角色检测: 项目根目录=%s, 配置文件=%s；冗余心跳网卡=%s, "
+            "功能网卡 %d 个: %s",
             project_root,
             role_json_path,
-            hb_nic,
-            fa_nic,
-            fb_nic,
+            self._redundancy_heartbeat_nic,
+            len(self._redundancy_functional_nics),
+            fnic_log,
         )
 
         master_ip, standby_ip = peer_ipv4s_from_role_document(doc)
@@ -367,7 +392,7 @@ class RuntimeManager:
         )
 
         local_ip = self._ipv4_for_interface(self._redundancy_heartbeat_nic)
-        self._redundancy_local_ens35_ip = local_ip
+        self._redundancy_local_heartbeat_ip = local_ip
         if local_ip is None:
             logger.error(
                 "[热冗余] 无法读取网卡 %s 的 IPv4 地址，本机不启用热冗余。"
@@ -426,6 +451,20 @@ class RuntimeManager:
             standby_ip,
         )
 
+    def reload_functional_nics_from_disk(self) -> None:
+        """Reload functional_nics[] from redundancy_role.json (e.g. after host CIDR sync)."""
+        project_root = self._openplc_project_root()
+        doc = load_redundancy_role_document(project_root)
+        if doc is None:
+            return
+        self._redundancy_functional_nics = functional_nics_from_role_document(doc)
+        logger.info(
+            "[热冗余] 已从 %s 重新加载 %d 个功能网卡: %s",
+            REDUNDANCY_ROLE_FILENAME,
+            len(self._redundancy_functional_nics),
+            self._format_functional_nic_names_for_log(self._redundancy_functional_nics),
+        )
+
     def _shutdown_redundancy_heartbeat_threads(self) -> None:
         self._heartbeat_stop.set()
         for t in list(self._heartbeat_threads):
@@ -448,31 +487,34 @@ class RuntimeManager:
 
     def _redundancy_ping_master_reachable(self) -> bool:
         """
-        分别 ping 主机两条功能网口在 redundancy_role.json 中 permanent_master_functional_* 的 IPv4，不用冗余心跳口 IP。
-        只要有一条功能 IP 能 ping 通即视为主机仍可达；两条均无响应则判定为故障（返回 False）。
+        分别 ping 各功能网口在 redundancy_role.json 中 permanent_master 的 IPv4，不用冗余心跳口 IP。
+        只要有一条功能 IP 能 ping 通即视为主机仍可达；均无响应则判定为故障（返回 False）。
         """
         project_root = self._openplc_project_root()
         role_json_path = project_root / REDUNDANCY_ROLE_FILENAME
-        c33, c34 = read_functional_cidrs_for_project(project_root)
+        permanent_cidrs = read_functional_cidrs_for_project(project_root)
+        fnic_log = self._format_functional_nic_names_for_log(self._redundancy_functional_nics)
 
         targets: list[tuple[str, str]] = []
-        if c33:
-            targets.append(
-                (self._redundancy_functional_nic_a, str(ipaddress.IPv4Interface(c33).ip))
-            )
-        if c34:
-            targets.append(
-                (self._redundancy_functional_nic_b, str(ipaddress.IPv4Interface(c34).ip))
-            )
+        for entry, cidr in zip(self._redundancy_functional_nics, permanent_cidrs):
+            if cidr:
+                targets.append(
+                    (entry.linux_ifname, str(ipaddress.IPv4Interface(cidr).ip))
+                )
 
         if not targets:
-            logger.warning(
-                "[热冗余][备机] 故障探测：无法从 %s 读取主机功能 IPv4（字段 %s / %s），"
-                "无法进行 ping，按主机不可达处理。",
-                role_json_path,
-                REDUNDANCY_ROLE_KEY_PERMANENT_MASTER_FUNCTIONAL_A_CIDR,
-                REDUNDANCY_ROLE_KEY_PERMANENT_MASTER_FUNCTIONAL_B_CIDR,
-            )
+            if not self._redundancy_functional_nics:
+                logger.info(
+                    "[热冗余][备机] 故障探测：未配置功能网卡（%s），跳过 ping，按主机不可达处理。",
+                    fnic_log,
+                )
+            else:
+                logger.warning(
+                    "[热冗余][备机] 故障探测：网卡 %s 在 %s 中无有效 permanent_master_ipv4_cidr，"
+                    "无法进行 ping，按主机不可达处理。",
+                    fnic_log,
+                    role_json_path,
+                )
             return False
 
         any_ok = False
@@ -501,49 +543,60 @@ class RuntimeManager:
 
     def _redundancy_trigger_standby_to_master_switch(self) -> None:
         """
-        备升主（暂时）：先将本机 JSON 配置的两块功能网卡地址写入 standby_backup_functional_*，
-        再应用 permanent_master_functional_* 中记录的主机功能 IP；
+        备升主（暂时）：先将本机功能口地址写入 functional_nics[].standby_backup_*，
+        再应用 functional_nics[].permanent_master_* 中记录的主机功能 IP；
         PLC 非影子；is_master 不变；继续监听冗余口，收到原主机心跳载荷后异步回切。
         """
         logger.info("[热冗余][备机] 备机升主机已触发（暂时，JSON 中永久主备角色不变）")
+        if not self._redundancy_functional_nics:
+            logger.error("[热冗余][备机] 升主中止：未配置功能网卡")
+            return
         project_root = self._openplc_project_root()
         role_json_path = project_root / REDUNDANCY_ROLE_FILENAME
-        standby33 = self._ipv4_cidr_for_interface(self._redundancy_functional_nic_a)
-        standby34 = self._ipv4_cidr_for_interface(self._redundancy_functional_nic_b)
-        if not standby33 or not standby34:
-            logger.error(
-                "[热冗余][备机] 升主中止：无法读取本机 %s/%s 的 IPv4/CIDR",
-                self._redundancy_functional_nic_a,
-                self._redundancy_functional_nic_b,
-            )
-            return
+        standby_backups: list[str] = []
+        for entry in self._redundancy_functional_nics:
+            backup_cidr = self._ipv4_cidr_for_interface(entry.linux_ifname)
+            if not backup_cidr:
+                logger.error(
+                    "[热冗余][备机] 升主中止：无法读取本机网卡 %s 的 IPv4/CIDR",
+                    entry.linux_ifname,
+                )
+                return
+            standby_backups.append(backup_cidr)
         try:
-            write_redundancy_role_standby_backup_cidrs(role_json_path, standby33, standby34)
+            write_redundancy_role_standby_backup_cidrs(role_json_path, standby_backups)
+            pairs = ", ".join(
+                f"{e.linux_ifname}={c}"
+                for e, c in zip(self._redundancy_functional_nics, standby_backups)
+            )
             logger.info(
-                "[热冗余][备机] 已写入备机功能地址到 %s 字段 %s/%s: %s, %s",
+                "[热冗余][备机] 已写入 %d 个备机功能地址到 %s.%s: %s",
+                len(standby_backups),
                 role_json_path,
-                REDUNDANCY_ROLE_KEY_STANDBY_BACKUP_FUNCTIONAL_A_CIDR,
-                REDUNDANCY_ROLE_KEY_STANDBY_BACKUP_FUNCTIONAL_B_CIDR,
-                standby33,
-                standby34,
+                REDUNDANCY_ROLE_KEY_FUNCTIONAL_NICS,
+                pairs,
             )
         except OSError as e:
-            logger.error("[热冗余][备机] 写入 standby_backup_functional_* 失败: %s", e)
+            logger.error("[热冗余][备机] 写入 functional_nics standby_backup 失败: %s", e)
             return
 
-        c33, c34 = read_functional_cidrs_for_project(project_root)
-        if not c33 or not c34:
+        permanent_cidrs = read_functional_cidrs_for_project(project_root)
+        if len(permanent_cidrs) != len(self._redundancy_functional_nics) or not all(permanent_cidrs):
             logger.error(
-                "[热冗余][备机] 升主中止：%s 缺少有效的 %s / %s（需先由主机记录功能 IP）",
+                "[热冗余][备机] 升主中止：%s 中 %s 缺少有效的 permanent_master_ipv4_cidr（需先由主机记录功能 IP）",
                 role_json_path,
-                REDUNDANCY_ROLE_KEY_PERMANENT_MASTER_FUNCTIONAL_A_CIDR,
-                REDUNDANCY_ROLE_KEY_PERMANENT_MASTER_FUNCTIONAL_B_CIDR,
+                REDUNDANCY_ROLE_KEY_FUNCTIONAL_NICS,
             )
             return
-        if not self._apply_ipv4_cidr_to_linux_interface(self._redundancy_functional_nic_a, c33):
-            return
-        if not self._apply_ipv4_cidr_to_linux_interface(self._redundancy_functional_nic_b, c34):
-            return
+        for entry, master_cidr in zip(self._redundancy_functional_nics, permanent_cidrs):
+            if not master_cidr:
+                logger.error(
+                    "[热冗余][备机] 升主中止：网卡 %s 无 permanent_master 地址",
+                    entry.linux_ifname,
+                )
+                return
+            if not self._apply_ipv4_cidr_to_linux_interface(entry.linux_ifname, master_cidr):
+                return
 
         self._standby_switched_to_master = True
         self._plc_shadow_standby = False
@@ -576,17 +629,19 @@ class RuntimeManager:
             return False
 
     def _redundancy_trigger_failback_to_standby(self) -> None:
-        """收到原主机冗余心跳后回切：按 standby_backup_functional_* 恢复两块功能网卡，影子 PLC。"""
+        """收到原主机冗余心跳后回切：按 functional_nics[].standby_backup_* 恢复各功能网卡，影子 PLC。"""
         logger.info("[热冗余][备机] 回切备机已触发")
         project_root = self._openplc_project_root()
         role_json_path = project_root / REDUNDANCY_ROLE_FILENAME
-        b33, b34 = read_standby_backup_cidrs_for_project(project_root)
-        if b33 and b34:
-            self._apply_ipv4_cidr_to_linux_interface(self._redundancy_functional_nic_a, b33)
-            self._apply_ipv4_cidr_to_linux_interface(self._redundancy_functional_nic_b, b34)
-        else:
+        backup_cidrs = read_standby_backup_cidrs_for_project(project_root)
+        restored = False
+        for entry, backup in zip(self._redundancy_functional_nics, backup_cidrs):
+            if backup:
+                self._apply_ipv4_cidr_to_linux_interface(entry.linux_ifname, backup)
+                restored = True
+        if self._redundancy_functional_nics and not restored:
             logger.warning(
-                "[热冗余][备机] standby_backup_functional_* 无效，跳过恢复功能口 IP（请检查 %s）",
+                "[热冗余][备机] functional_nics standby_backup 无效，跳过恢复功能口 IP（请检查 %s）",
                 role_json_path,
             )
 
@@ -683,9 +738,10 @@ class RuntimeManager:
             return lost_times, False
         if self._redundancy_ping_master_reachable():
             logger.info(
-                "[热冗余][备机] LostTimes=%d 已超过阈值 %d 秒，但主机功能口仍有可达地址，清零计数。",
+                "[热冗余][备机] LostTimes=%d 已超过阈值 %d 秒，但功能网卡 %s 上仍有可达的主机地址，清零计数。",
                 lost_times,
                 REDUNDANCY_STANDBY_LOST_THRESHOLD_SEC,
+                self._format_functional_nic_names_for_log(self._redundancy_functional_nics),
             )
             return 0, False
         self._schedule_async_standby_to_master_switch()
@@ -719,7 +775,7 @@ class RuntimeManager:
         """
         每秒：TCP 已连接则发送心跳；否则尝试连接备机。无数、无超时切换、永久循环直至 stop。
         """
-        local_ip = self._redundancy_local_ens35_ip
+        local_ip = self._redundancy_local_heartbeat_ip
         peer_ip = self._redundancy_standby_ip
         if not local_ip or not peer_ip:
             return
@@ -790,9 +846,9 @@ class RuntimeManager:
     def _redundancy_standby_tcp_heartbeat_loop(self) -> None:
         """
         备机：纯备机态 LostTimes / 升主；暂时升主后仍监听，accept 超时不计数，
-        收到原主机发来的心跳载荷后异步回切（影子 PLC + 按 standby_backup_functional_* 恢复功能 IP）。
+        收到原主机发来的心跳载荷后异步回切（影子 PLC + 按 functional_nics standby_backup 恢复功能 IP）。
         """
-        local_ip = self._redundancy_local_ens35_ip
+        local_ip = self._redundancy_local_heartbeat_ip
         master_redundancy_ip = self._redundancy_master_ip
         if not local_ip:
             return
@@ -1014,10 +1070,13 @@ class RuntimeManager:
 
         Applies only when local plc_main is RUNNING (process image pointers ready).
         """
-        local_ip = self._redundancy_local_ens35_ip
+        local_ip = self._redundancy_local_heartbeat_ip
         master_ip = self._redundancy_master_ip
         if not local_ip or not master_ip:
-            logger.warning("[热冗余][备机] 冗余 IP 未就绪，跳过 I/O 镜像监听")
+            logger.warning(
+                "[热冗余][备机] 冗余心跳网卡 %s 地址未就绪，跳过 I/O 镜像监听",
+                self._redundancy_heartbeat_nic,
+            )
             return
 
         server: socket.socket | None = None
