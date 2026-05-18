@@ -25,7 +25,8 @@ DEFAULT_FUNCTIONAL_IO_NIC_A_LINUX_IFNAME = "ens33"
 DEFAULT_FUNCTIONAL_IO_NIC_B_LINUX_IFNAME = "ens34"
 
 _LINUX_IFNAME_MAX_LEN = 15
-_LINUX_IFNAME_RE = re.compile(r"^[A-Za-z0-9._-]{1,15}$")
+# IFNAMSIZ=15; allow legacy alias names (eth2:1), dots, underscores, hyphens.
+_LINUX_IFNAME_RE = re.compile(r"^[A-Za-z0-9.:_-]{1,15}$")
 
 DEFAULT_REDUNDANCY_ROLE_ABOUT = (
     "Hot-redundancy role and addressing for this OpenPLC pair. "
