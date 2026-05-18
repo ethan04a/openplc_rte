@@ -1,4 +1,5 @@
 import ipaddress
+import json
 import os
 import socket
 import struct
@@ -57,6 +58,8 @@ REDUNDANCY_IMAGE_MAGIC = b"OPIM"
 # Hot redundancy: HTTP peer sync (receive-program / sync-role-ini header X-OpenPLC-Redundancy-Sync)
 REDUNDANCY_SYNC_SECRET = "openplc"
 REDUNDANCY_HB_PAYLOAD = b"OPENPLC_REDUNDANCY_HB_V1\n"
+REDUNDANCY_FUNC_SYNC_MAGIC = b"OPENPLC_REDUNDANCY_FUNC_V1\n"
+REDUNDANCY_FUNC_SYNC_MAX_JSON_BYTES = 65536
 REDUNDANCY_MASTER_HEARTBEAT_INTERVAL_SEC = 1.0
 REDUNDANCY_STANDBY_RECV_IDLE_SEC = 1.0
 # Standby: seconds without TCP heartbeat before ping master for failover decision
@@ -136,14 +139,57 @@ class RuntimeManager:
             return "(无)"
         return ", ".join(entry.linux_ifname for entry in functional_nics)
 
+    _IP_ADDR_SCOPE_FLAGS = frozenset(
+        {
+            "global",
+            "link",
+            "host",
+            "noprefixroute",
+            "secondary",
+            "dynamic",
+            "permanent",
+        }
+    )
+    _IP_ADDR_LIFETIME_TOKENS = frozenset({"valid_lft", "preferred_lft", "forever"})
+
     @staticmethod
-    def _parse_ip_o_addr_line(line: str) -> tuple[str | None, str | None]:
+    def _normalize_ip_addr_label_token(token: str) -> str:
+        return token.rstrip("\\").strip()
+
+    @classmethod
+    def _interface_label_from_ip_o_addr_parts(cls, parts: list[str], inet_idx: int) -> str | None:
+        """
+        Extract the address label from one `ip -o addr` line.
+
+        Modern ip may append ``valid_lft forever preferred_lft forever`` after the label;
+        the label is the token immediately before ``valid_lft``, not the last token.
+        """
+        try:
+            vidx = parts.index("valid_lft", inet_idx + 1)
+            if vidx > inet_idx + 1:
+                return cls._normalize_ip_addr_label_token(parts[vidx - 1])
+        except ValueError:
+            pass
+
+        for i in range(len(parts) - 1, inet_idx + 1, -1):
+            tok = cls._normalize_ip_addr_label_token(parts[i])
+            if not tok or tok in cls._IP_ADDR_LIFETIME_TOKENS or tok in cls._IP_ADDR_SCOPE_FLAGS:
+                continue
+            if tok in ("brd", "scope", "inet", "dev"):
+                continue
+            if "/" in tok or tok.replace(".", "").isdigit():
+                continue
+            return tok
+        return None
+
+    @classmethod
+    def _parse_ip_o_addr_line(cls, line: str) -> tuple[str | None, str | None]:
         """
         Parse one line of `ip -4 -o addr show` output.
 
         Returns (ipv4_cidr, label) where label is the address label on the line
-        (last token, e.g. eth0:2). When one physical NIC has several IPv4 aliases,
-        each line has a distinct label; callers must match label to the requested ifname.
+        (e.g. eth0:2). When one physical NIC has several IPv4 aliases, each line has a
+        distinct label; callers must match label to the requested ifname.
         """
         stripped = line.strip()
         if not stripped:
@@ -156,14 +202,14 @@ class RuntimeManager:
         if inet_idx + 1 >= len(parts):
             return None, None
         cidr = parts[inet_idx + 1].strip()
-        label = parts[-1].rstrip("\\")
+        label = cls._interface_label_from_ip_o_addr_parts(parts, inet_idx)
         return cidr, label
 
-    @staticmethod
-    def _ipv4_cidr_from_ip_addr_show_output(out: str, ifname: str) -> str | None:
+    @classmethod
+    def _ipv4_cidr_from_ip_addr_show_output(cls, out: str, ifname: str) -> str | None:
         """Pick the IPv4 CIDR on the line whose label exactly equals ifname."""
         for line in out.splitlines():
-            cidr, label = RuntimeManager._parse_ip_o_addr_line(line)
+            cidr, label = cls._parse_ip_o_addr_line(line)
             if not cidr or label != ifname:
                 continue
             try:
@@ -202,13 +248,31 @@ class RuntimeManager:
                         return str(entry.address)
         return None
 
-    @staticmethod
-    def _ipv4_cidr_for_interface(ifname: str) -> str | None:
+    @classmethod
+    def _ipv4_cidr_for_interface(cls, ifname: str) -> str | None:
         """Return IPv4 CIDR on ifname (exact label match), or None."""
-        out = RuntimeManager._run_ip_addr_show(ifname)
-        if out is None:
-            return None
-        return RuntimeManager._ipv4_cidr_from_ip_addr_show_output(out, ifname)
+        out = cls._run_ip_addr_show(ifname)
+        if out is not None:
+            cidr = cls._ipv4_cidr_from_ip_addr_show_output(out, ifname)
+            if cidr is not None:
+                return cidr
+
+        if HAS_PSUTIL and psutil is not None:
+            addrs = psutil.net_if_addrs().get(ifname)
+            if addrs is not None:
+                for entry in addrs:
+                    if entry.family == socket.AF_INET and entry.netmask:
+                        try:
+                            prefix = ipaddress.IPv4Network(
+                                f"0.0.0.0/{entry.netmask}", strict=False
+                            ).prefixlen
+                            return f"{entry.address}/{prefix}"
+                        except ValueError:
+                            if entry.address:
+                                return f"{entry.address}/32"
+                    elif entry.family == socket.AF_INET and entry.address:
+                        return f"{entry.address}/32"
+        return None
 
     @staticmethod
     def _apply_ipv4_cidr_to_linux_interface(ifname: str, cidr: str) -> bool:
@@ -288,8 +352,128 @@ class RuntimeManager:
         except Exception as e:
             logger.error("[热冗余] 功能 IP 记录异常: %s", e)
 
-    def _sync_functional_lines_after_tcp_connect(self) -> None:
-        """主机 TCP 心跳连上备机后，再尝试同步 redundancy_role.json 的 functional_nics 到备机。"""
+    @staticmethod
+    def _encode_functional_cidr_sync_message(permanent_master_cidrs: list[str]) -> bytes:
+        body = json.dumps(
+            {"permanent_master_ipv4_cidrs": permanent_master_cidrs},
+            ensure_ascii=False,
+        ).encode("utf-8")
+        if len(body) > REDUNDANCY_FUNC_SYNC_MAX_JSON_BYTES:
+            raise ValueError("functional CIDR sync JSON too large")
+        return REDUNDANCY_FUNC_SYNC_MAGIC + struct.pack("!I", len(body)) + body
+
+    @staticmethod
+    def _decode_functional_cidr_sync_body(body: bytes) -> list[str]:
+        doc = json.loads(body.decode("utf-8"))
+        raw = doc.get("permanent_master_ipv4_cidrs")
+        if not isinstance(raw, list):
+            raise ValueError("missing permanent_master_ipv4_cidrs array")
+        cidrs = [str(c).strip() for c in raw if str(c).strip()]
+        if not cidrs:
+            raise ValueError("empty permanent_master_ipv4_cidrs")
+        for cidr in cidrs:
+            ipaddress.IPv4Interface(cidr)
+        return cidrs
+
+    @classmethod
+    def _try_take_functional_sync_from_buffer(cls, buf: bytes) -> tuple[bytes, list[str] | None]:
+        """
+        If a complete functional-nic sync frame is present, return (remaining_buf, cidrs).
+        Otherwise return (buf, None) and keep partial frame in buf.
+        """
+        idx = buf.find(REDUNDANCY_FUNC_SYNC_MAGIC)
+        if idx < 0:
+            if len(buf) > 131072:
+                return buf[-8192:], None
+            return buf, None
+        if idx > 0:
+            buf = buf[idx:]
+        header_end = len(REDUNDANCY_FUNC_SYNC_MAGIC) + 4
+        if len(buf) < header_end:
+            return buf, None
+        (body_len,) = struct.unpack("!I", buf[len(REDUNDANCY_FUNC_SYNC_MAGIC) : header_end])
+        if body_len > REDUNDANCY_FUNC_SYNC_MAX_JSON_BYTES:
+            return buf[1:], None
+        frame_len = header_end + body_len
+        if len(buf) < frame_len:
+            return buf, None
+        body = buf[header_end:frame_len]
+        try:
+            cidrs = cls._decode_functional_cidr_sync_body(body)
+        except (ValueError, json.JSONDecodeError, UnicodeDecodeError):
+            return buf[1:], None
+        return buf[frame_len:], cidrs
+
+    @classmethod
+    def _try_take_heartbeat_from_buffer(cls, buf: bytes) -> tuple[bytes, bool]:
+        idx = buf.find(REDUNDANCY_HB_PAYLOAD)
+        if idx < 0:
+            if len(buf) > 65536:
+                return buf[-4096:], False
+            return buf, False
+        return buf[idx + len(REDUNDANCY_HB_PAYLOAD) :], True
+
+    def _consume_standby_redundancy_tcp_buffer(self, buf: bytes) -> tuple[bytes, bool]:
+        """Parse heartbeat / functional-CIDR sync from standby TCP stream."""
+        heartbeat_seen = False
+        while True:
+            progressed = False
+            buf, cidrs = self._try_take_functional_sync_from_buffer(buf)
+            if cidrs is not None:
+                progressed = True
+                self._apply_peer_functional_cidr_sync(cidrs)
+            buf, hb = self._try_take_heartbeat_from_buffer(buf)
+            if hb:
+                progressed = True
+                heartbeat_seen = True
+            if not progressed:
+                break
+        return buf, heartbeat_seen
+
+    def _apply_peer_functional_cidr_sync(self, cidrs: list[str]) -> None:
+        role_json_path = self._openplc_project_root() / REDUNDANCY_ROLE_FILENAME
+        if write_redundancy_role_functional_cidrs(role_json_path, cidrs):
+            self.reload_functional_nics_from_disk()
+            logger.info(
+                "[热冗余][备机] 已通过冗余 TCP 写入 %d 项 functional_nics permanent_master",
+                len(cidrs),
+            )
+        else:
+            logger.error(
+                "[热冗余][备机] 冗余 TCP 同步 permanent_master 写入 %s 失败",
+                role_json_path,
+            )
+
+    def _push_functional_cidrs_over_heartbeat_tcp(
+        self, sock: socket.socket, cidrs: list[str]
+    ) -> bool:
+        try:
+            sock.sendall(self._encode_functional_cidr_sync_message(cidrs))
+            logger.info(
+                "[热冗余][主机] 已通过冗余 TCP 向备机发送 %d 项 functional_nics permanent_master",
+                len(cidrs),
+            )
+            return True
+        except OSError as e:
+            logger.warning("[热冗余][主机] 冗余 TCP 发送 functional_nics 失败: %s", e)
+            return False
+
+    def _apply_master_functional_cidrs_locally(self, cidrs: list[str]) -> None:
+        for entry, cidr in zip(self._redundancy_functional_nics, cidrs):
+            if not self._apply_ipv4_cidr_to_linux_interface(entry.linux_ifname, cidr):
+                logger.warning(
+                    "[热冗余][主机] 同步成功后配置本机功能口 %s 失败",
+                    entry.linux_ifname,
+                )
+
+    def _clear_functional_lines_pending_sync(self) -> None:
+        with self._functional_sync_lock:
+            self._functional_lines_pending_sync = None
+
+    def _sync_functional_lines_after_tcp_connect(
+        self, heartbeat_sock: socket.socket | None = None
+    ) -> None:
+        """主机 TCP 心跳连上备机后，同步 functional_nics permanent_master 到备机。"""
         standby_ip = self._redundancy_standby_ip
         if not standby_ip:
             return
@@ -298,28 +482,43 @@ class RuntimeManager:
         if not pending:
             return
 
-        cidrs = pending
+        cidrs = list(pending)
+        logger.info(
+            "[热冗余][主机] TCP 心跳连接已建立，开始同步 %s 中 %d 个 functional_nics permanent_master 到备机 %s。",
+            REDUNDANCY_ROLE_FILENAME,
+            len(cidrs),
+            standby_ip,
+        )
+
+        if heartbeat_sock is not None and self._push_functional_cidrs_over_heartbeat_tcp(
+            heartbeat_sock, cidrs
+        ):
+            self._clear_functional_lines_pending_sync()
+            self._apply_master_functional_cidrs_locally(cidrs)
+            return
+
         try:
             from webserver.redundancy_program_sync import push_role_ini_functional_to_standby
 
-            logger.info(
-                "[热冗余][主机] TCP 心跳连接已建立，开始同步 %s 中 %d 个 functional_nics permanent_master 到备机 %s。",
-                REDUNDANCY_ROLE_FILENAME,
-                len(cidrs),
-                standby_ip,
-            )
             pushed = push_role_ini_functional_to_standby(
                 standby_ip, cidrs, REDUNDANCY_SYNC_SECRET
             )
             if pushed:
-                for entry, cidr in zip(self._redundancy_functional_nics, cidrs):
-                    if not self._apply_ipv4_cidr_to_linux_interface(entry.linux_ifname, cidr):
-                        logger.warning(
-                            "[热冗余][主机] 同步成功后配置本机功能口 %s 失败",
-                            entry.linux_ifname,
-                        )
+                self._clear_functional_lines_pending_sync()
+                self._apply_master_functional_cidrs_locally(cidrs)
+            else:
+                logger.warning(
+                    "[热冗余][主机] HTTPS 同步 functional_nics 失败（备机 %s:8443 不可达或未监听），"
+                    "将在下次 TCP 心跳重连时重试；也可在备机开放 8443 或检查 Web 服务是否已启动。",
+                    standby_ip,
+                )
         except Exception as e:
-            logger.error("[热冗余][主机] TCP 建连后同步 functional_nics 异常: %s", e)
+            logger.error(
+                "[热冗余][主机] TCP 建连后同步 functional_nics 异常: %s "
+                "（已尝试冗余 TCP%s）",
+                e,
+                "" if heartbeat_sock is not None else "，无可用心跳套接字",
+            )
 
     def _evaluate_redundancy_role(self) -> None:
         """
@@ -789,7 +988,7 @@ class RuntimeManager:
                     sock.bind((local_ip, 0))
                     sock.settimeout(10.0)
                     sock.connect((peer_ip, REDUNDANCY_HEARTBEAT_PORT))
-                    self._sync_functional_lines_after_tcp_connect()
+                    self._sync_functional_lines_after_tcp_connect(sock)
                 except OSError as e:
                     logger.warning(
                         "[热冗余][主机] 连接对端 TCP %s:%d 失败，将在 %.1f 秒后重试: %s",
@@ -911,13 +1110,8 @@ class RuntimeManager:
                             if not chunk:
                                 break
                             buf += chunk
-                            while True:
-                                idx = buf.find(REDUNDANCY_HB_PAYLOAD)
-                                if idx < 0:
-                                    if len(buf) > 65536:
-                                        buf = buf[-4096:]
-                                    break
-                                buf = buf[idx + len(REDUNDANCY_HB_PAYLOAD) :]
+                            buf, heartbeat_seen = self._consume_standby_redundancy_tcp_buffer(buf)
+                            if heartbeat_seen:
                                 logger.info("[热冗余][备机] 收到原主机心跳，触发自动回切")
                                 self._schedule_async_failback_to_standby()
                                 try:
@@ -980,13 +1174,8 @@ class RuntimeManager:
                             )
                             break
                         buf += chunk
-                        while True:
-                            idx = buf.find(REDUNDANCY_HB_PAYLOAD)
-                            if idx < 0:
-                                if len(buf) > 65536:
-                                    buf = buf[-4096:]
-                                break
-                            buf = buf[idx + len(REDUNDANCY_HB_PAYLOAD) :]
+                        buf, heartbeat_seen = self._consume_standby_redundancy_tcp_buffer(buf)
+                        if heartbeat_seen:
                             lost_times = 0
                 finally:
                     try:
