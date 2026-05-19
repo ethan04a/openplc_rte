@@ -225,6 +225,20 @@ class RuntimeManager:
                 continue
         return result
 
+    @staticmethod
+    def _netdev_and_address_label(ifname: str) -> tuple[str, str | None]:
+        """
+        Map configured linux_ifname to kernel netdev and optional address label.
+
+        Legacy alias names (eth2:1 on netdev eth2) share one physical device with other
+        labeled addresses (e.g. heartbeat on eth2:3). ip(8) must use ``dev eth2`` plus
+        ``label eth2:1``, not ``dev eth2:1``, or other addresses on eth2 are affected.
+        """
+        name = ifname.strip()
+        if ":" in name:
+            return name.split(":", 1)[0], name
+        return name, None
+
     @classmethod
     def _list_ipv4_cidrs_on_interface(cls, ifname: str) -> list[str]:
         """Return every IPv4 CIDR assigned to ifname (supports multi-address / alias NICs)."""
@@ -233,11 +247,15 @@ class RuntimeManager:
             return []
         return cls._ipv4_cidrs_from_ip_addr_show_output(out, ifname)
 
-    @staticmethod
-    def _run_ip_addr_show(ifname: str) -> str | None:
+    @classmethod
+    def _run_ip_addr_show(cls, ifname: str) -> str | None:
+        netdev, address_label = cls._netdev_and_address_label(ifname)
+        cmd = ["ip", "-4", "-o", "addr", "show", "dev", netdev]
+        if address_label is not None:
+            cmd.extend(["label", address_label])
         try:
             return subprocess.check_output(
-                ["ip", "-4", "-o", "addr", "show", "dev", ifname],
+                cmd,
                 stderr=subprocess.DEVNULL,
                 text=True,
                 timeout=5,
@@ -289,11 +307,21 @@ class RuntimeManager:
                         return f"{entry.address}/32"
         return None
 
-    @staticmethod
-    def _ip_addr_del_on_interface(ifname: str, cidr: str) -> bool:
+    @classmethod
+    def _ip_addr_command_base(cls, ifname: str) -> tuple[list[str], str, str | None]:
+        """Build shared ``ip addr`` prefix: returns (cmd_prefix, netdev, address_label)."""
+        netdev, address_label = cls._netdev_and_address_label(ifname)
+        return ["ip", "addr"], netdev, address_label
+
+    @classmethod
+    def _ip_addr_del_on_interface(cls, ifname: str, cidr: str) -> bool:
+        prefix, netdev, address_label = cls._ip_addr_command_base(ifname)
+        cmd = [*prefix, "del", cidr, "dev", netdev]
+        if address_label is not None:
+            cmd.extend(["label", address_label])
         try:
             r = subprocess.run(
-                ["ip", "addr", "del", cidr, "dev", ifname],
+                cmd,
                 check=False,
                 capture_output=True,
                 text=True,
@@ -316,6 +344,31 @@ class RuntimeManager:
             return False
 
     @classmethod
+    def _ip_addr_add_on_interface(cls, ifname: str, cidr: str) -> subprocess.CompletedProcess[str]:
+        prefix, netdev, address_label = cls._ip_addr_command_base(ifname)
+        cmd = [*prefix, "add", cidr, "dev", netdev]
+        if address_label is not None:
+            cmd.extend(["label", address_label])
+        return subprocess.run(
+            cmd,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+
+    @classmethod
+    def _link_set_interface_up(cls, ifname: str) -> None:
+        netdev, _ = cls._netdev_and_address_label(ifname)
+        subprocess.run(
+            ["ip", "link", "set", netdev, "up"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+
+    @classmethod
     def _apply_ipv4_cidr_to_linux_interface(
         cls,
         ifname: str,
@@ -327,7 +380,8 @@ class RuntimeManager:
         Add one IPv4 on ifname without flushing other addresses on that device.
 
         For multi-IP / legacy alias interfaces (eth2:1, eth2:2): only removes remove_cidr
-        when provided, then adds the target if missing. Does not use ``ip addr flush``.
+        on the matching address label, then adds the target with the same label. Other
+        labeled addresses on the same netdev (e.g. heartbeat eth2:3) are not touched.
         """
         try:
             target = str(ipaddress.IPv4Interface(cidr.strip()))
@@ -341,13 +395,7 @@ class RuntimeManager:
                 )
 
             if _has_target():
-                subprocess.run(
-                    ["ip", "link", "set", ifname, "up"],
-                    check=False,
-                    capture_output=True,
-                    text=True,
-                    timeout=10,
-                )
+                cls._link_set_interface_up(ifname)
                 logger.info("[热冗余] %s 已存在地址 %s，跳过添加", ifname, target)
                 return True
 
@@ -361,24 +409,12 @@ class RuntimeManager:
                         if not cls._ip_addr_del_on_interface(ifname, existing_cidr):
                             return False
 
-            r = subprocess.run(
-                ["ip", "addr", "add", target, "dev", ifname],
-                check=False,
-                capture_output=True,
-                text=True,
-                timeout=30,
-            )
+            r = cls._ip_addr_add_on_interface(ifname, target)
             if r.returncode != 0:
                 err = (r.stderr or r.stdout or "").strip()
                 if "File exists" in err or "EEXIST" in err:
                     if _has_target():
-                        subprocess.run(
-                            ["ip", "link", "set", ifname, "up"],
-                            check=False,
-                            capture_output=True,
-                            text=True,
-                            timeout=10,
-                        )
+                        cls._link_set_interface_up(ifname)
                         logger.info("[热冗余] %s 已存在地址 %s", ifname, target)
                         return True
                 logger.error(
@@ -389,13 +425,7 @@ class RuntimeManager:
                 )
                 return False
 
-            subprocess.run(
-                ["ip", "link", "set", ifname, "up"],
-                check=False,
-                capture_output=True,
-                text=True,
-                timeout=10,
-            )
+            cls._link_set_interface_up(ifname)
             if remove_cidr:
                 logger.info(
                     "[热冗余] %s 已切换地址：移除 %s，添加 %s",
