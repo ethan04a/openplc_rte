@@ -208,15 +208,30 @@ class RuntimeManager:
     @classmethod
     def _ipv4_cidr_from_ip_addr_show_output(cls, out: str, ifname: str) -> str | None:
         """Pick the IPv4 CIDR on the line whose label exactly equals ifname."""
+        cidrs = cls._ipv4_cidrs_from_ip_addr_show_output(out, ifname)
+        return cidrs[0] if cidrs else None
+
+    @classmethod
+    def _ipv4_cidrs_from_ip_addr_show_output(cls, out: str, ifname: str) -> list[str]:
+        """All IPv4 CIDRs on lines whose address label equals ifname."""
+        result: list[str] = []
         for line in out.splitlines():
             cidr, label = cls._parse_ip_o_addr_line(line)
             if not cidr or label != ifname:
                 continue
             try:
-                return str(ipaddress.IPv4Interface(cidr))
+                result.append(str(ipaddress.IPv4Interface(cidr)))
             except ValueError:
                 continue
-        return None
+        return result
+
+    @classmethod
+    def _list_ipv4_cidrs_on_interface(cls, ifname: str) -> list[str]:
+        """Return every IPv4 CIDR assigned to ifname (supports multi-address / alias NICs)."""
+        out = cls._run_ip_addr_show(ifname)
+        if out is None:
+            return []
+        return cls._ipv4_cidrs_from_ip_addr_show_output(out, ifname)
 
     @staticmethod
     def _run_ip_addr_show(ifname: str) -> str | None:
@@ -275,31 +290,105 @@ class RuntimeManager:
         return None
 
     @staticmethod
-    def _apply_ipv4_cidr_to_linux_interface(ifname: str, cidr: str) -> bool:
-        """Replace primary IPv4 on interface using ip(8). Requires appropriate privileges."""
+    def _ip_addr_del_on_interface(ifname: str, cidr: str) -> bool:
         try:
-            subprocess.run(
-                ["ip", "addr", "flush", "dev", ifname],
-                check=False,
-                capture_output=True,
-                text=True,
-                timeout=30,
-            )
             r = subprocess.run(
-                ["ip", "addr", "add", cidr, "dev", ifname],
+                ["ip", "addr", "del", cidr, "dev", ifname],
                 check=False,
                 capture_output=True,
                 text=True,
                 timeout=30,
             )
             if r.returncode != 0:
+                err = (r.stderr or r.stdout or "").strip()
+                if "Cannot assign" in err or "not found" in err.lower():
+                    return True
+                logger.warning(
+                    "[热冗余] ip addr del %s %s: %s",
+                    ifname,
+                    cidr,
+                    err,
+                )
+                return False
+            return True
+        except (OSError, subprocess.TimeoutExpired) as e:
+            logger.warning("[热冗余] ip addr del 异常 %s %s: %s", ifname, cidr, e)
+            return False
+
+    @classmethod
+    def _apply_ipv4_cidr_to_linux_interface(
+        cls,
+        ifname: str,
+        cidr: str,
+        *,
+        remove_cidr: str | None = None,
+    ) -> bool:
+        """
+        Add one IPv4 on ifname without flushing other addresses on that device.
+
+        For multi-IP / legacy alias interfaces (eth2:1, eth2:2): only removes remove_cidr
+        when provided, then adds the target if missing. Does not use ``ip addr flush``.
+        """
+        try:
+            target = str(ipaddress.IPv4Interface(cidr.strip()))
+            target_ip = str(ipaddress.IPv4Interface(target).ip)
+
+            def _has_target() -> bool:
+                return any(
+                    existing_cidr == target
+                    or str(ipaddress.IPv4Interface(existing_cidr).ip) == target_ip
+                    for existing_cidr in cls._list_ipv4_cidrs_on_interface(ifname)
+                )
+
+            if _has_target():
+                subprocess.run(
+                    ["ip", "link", "set", ifname, "up"],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                )
+                logger.info("[热冗余] %s 已存在地址 %s，跳过添加", ifname, target)
+                return True
+
+            if remove_cidr:
+                remove = str(ipaddress.IPv4Interface(remove_cidr.strip()))
+                remove_ip = str(ipaddress.IPv4Interface(remove).ip)
+                for existing_cidr in cls._list_ipv4_cidrs_on_interface(ifname):
+                    if existing_cidr == remove or str(
+                        ipaddress.IPv4Interface(existing_cidr).ip
+                    ) == remove_ip:
+                        if not cls._ip_addr_del_on_interface(ifname, existing_cidr):
+                            return False
+
+            r = subprocess.run(
+                ["ip", "addr", "add", target, "dev", ifname],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            if r.returncode != 0:
+                err = (r.stderr or r.stdout or "").strip()
+                if "File exists" in err or "EEXIST" in err:
+                    if _has_target():
+                        subprocess.run(
+                            ["ip", "link", "set", ifname, "up"],
+                            check=False,
+                            capture_output=True,
+                            text=True,
+                            timeout=10,
+                        )
+                        logger.info("[热冗余] %s 已存在地址 %s", ifname, target)
+                        return True
                 logger.error(
                     "[热冗余] ip addr add 失败 %s %s: %s",
                     ifname,
-                    cidr,
-                    (r.stderr or r.stdout or "").strip(),
+                    target,
+                    err,
                 )
                 return False
+
             subprocess.run(
                 ["ip", "link", "set", ifname, "up"],
                 check=False,
@@ -307,9 +396,17 @@ class RuntimeManager:
                 text=True,
                 timeout=10,
             )
-            logger.info("[热冗余] 已为 %s 设置地址 %s", ifname, cidr)
+            if remove_cidr:
+                logger.info(
+                    "[热冗余] %s 已切换地址：移除 %s，添加 %s",
+                    ifname,
+                    str(ipaddress.IPv4Interface(remove_cidr.strip())),
+                    target,
+                )
+            else:
+                logger.info("[热冗余] 已为 %s 添加地址 %s", ifname, target)
             return True
-        except (OSError, subprocess.TimeoutExpired) as e:
+        except (ValueError, OSError, subprocess.TimeoutExpired) as e:
             logger.error("[热冗余] 配置 %s 地址异常: %s", ifname, e)
             return False
 
@@ -803,14 +900,20 @@ class RuntimeManager:
                 REDUNDANCY_ROLE_KEY_FUNCTIONAL_NICS,
             )
             return
-        for entry, master_cidr in zip(self._redundancy_functional_nics, permanent_cidrs):
+        for entry, master_cidr, backup_cidr in zip(
+            self._redundancy_functional_nics, permanent_cidrs, standby_backups
+        ):
             if not master_cidr:
                 logger.error(
                     "[热冗余][备机] 升主中止：网卡 %s 无 permanent_master 地址",
                     entry.linux_ifname,
                 )
                 return
-            if not self._apply_ipv4_cidr_to_linux_interface(entry.linux_ifname, master_cidr):
+            if not self._apply_ipv4_cidr_to_linux_interface(
+                entry.linux_ifname,
+                master_cidr,
+                remove_cidr=backup_cidr,
+            ):
                 return
 
         self._standby_switched_to_master = True
@@ -849,10 +952,17 @@ class RuntimeManager:
         project_root = self._openplc_project_root()
         role_json_path = project_root / REDUNDANCY_ROLE_FILENAME
         backup_cidrs = read_standby_backup_cidrs_for_project(project_root)
+        permanent_cidrs = read_functional_cidrs_for_project(project_root)
         restored = False
-        for entry, backup in zip(self._redundancy_functional_nics, backup_cidrs):
+        for entry, backup, permanent in zip(
+            self._redundancy_functional_nics, backup_cidrs, permanent_cidrs
+        ):
             if backup:
-                self._apply_ipv4_cidr_to_linux_interface(entry.linux_ifname, backup)
+                self._apply_ipv4_cidr_to_linux_interface(
+                    entry.linux_ifname,
+                    backup,
+                    remove_cidr=permanent,
+                )
                 restored = True
         if self._redundancy_functional_nics and not restored:
             logger.warning(
