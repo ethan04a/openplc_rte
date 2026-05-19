@@ -260,7 +260,20 @@ class RuntimeManager:
                 text=True,
                 timeout=5,
             )
-        except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        except subprocess.CalledProcessError:
+            if address_label is None:
+                return None
+            try:
+                out = subprocess.check_output(
+                    ["ip", "-4", "-o", "addr", "show", "dev", netdev],
+                    stderr=subprocess.DEVNULL,
+                    text=True,
+                    timeout=5,
+                )
+            except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+                return None
+            return out
+        except (OSError, subprocess.TimeoutExpired):
             return None
 
     @staticmethod
@@ -314,14 +327,59 @@ class RuntimeManager:
         return ["ip", "addr"], netdev, address_label
 
     @classmethod
-    def _ip_addr_del_on_interface(cls, ifname: str, cidr: str) -> bool:
-        prefix, netdev, address_label = cls._ip_addr_command_base(ifname)
-        cmd = [*prefix, "del", cidr, "dev", netdev]
+    def _ip_addr_ifaddr_args(cls, cidr: str, netdev: str, address_label: str | None) -> list[str]:
+        """IFADDR + dev for add/replace (label is part of IFADDR, not valid on ``del``)."""
+        args = [cidr, "dev", netdev]
         if address_label is not None:
-            cmd.extend(["label", address_label])
+            args.extend(["label", address_label])
+        return args
+
+    @classmethod
+    def _ip_addr_flush_labeled(cls, ifname: str) -> bool:
+        """
+        Remove only addresses on netdev whose label matches ifname.
+
+        ``ip addr del`` does not accept ``label``; flushing by label is the safe way to
+        clear one alias without touching other labels on the same netdev (e.g. eth2:3).
+        """
+        netdev, address_label = cls._netdev_and_address_label(ifname)
+        if address_label is None:
+            return True
         try:
             r = subprocess.run(
-                cmd,
+                ["ip", "-4", "addr", "flush", "dev", netdev, "label", address_label],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            if r.returncode != 0:
+                err = (r.stderr or r.stdout or "").strip()
+                logger.warning(
+                    "[热冗余] ip addr flush %s label %s: %s",
+                    netdev,
+                    address_label,
+                    err,
+                )
+                return False
+            return True
+        except (OSError, subprocess.TimeoutExpired) as e:
+            logger.warning(
+                "[热冗余] ip addr flush 异常 %s label %s: %s",
+                netdev,
+                address_label,
+                e,
+            )
+            return False
+
+    @classmethod
+    def _ip_addr_del_on_interface(cls, ifname: str, cidr: str) -> bool:
+        netdev, address_label = cls._netdev_and_address_label(ifname)
+        if address_label is not None:
+            return cls._ip_addr_flush_labeled(ifname)
+        try:
+            r = subprocess.run(
+                ["ip", "addr", "del", cidr, "dev", netdev],
                 check=False,
                 capture_output=True,
                 text=True,
@@ -344,11 +402,17 @@ class RuntimeManager:
             return False
 
     @classmethod
-    def _ip_addr_add_on_interface(cls, ifname: str, cidr: str) -> subprocess.CompletedProcess[str]:
+    def _ip_addr_replace_on_interface(
+        cls, ifname: str, cidr: str
+    ) -> subprocess.CompletedProcess[str]:
+        """
+        Replace or add IPv4 on the given logical interface (netdev + optional label).
+
+        Prefer replace over del+add: ``ip addr del`` cannot scope by label and deleting
+        the primary IPv4 on a shared netdev can drop other labeled addresses.
+        """
         prefix, netdev, address_label = cls._ip_addr_command_base(ifname)
-        cmd = [*prefix, "add", cidr, "dev", netdev]
-        if address_label is not None:
-            cmd.extend(["label", address_label])
+        cmd = [*prefix, "replace", *cls._ip_addr_ifaddr_args(cidr, netdev, address_label)]
         return subprocess.run(
             cmd,
             check=False,
@@ -377,11 +441,11 @@ class RuntimeManager:
         remove_cidr: str | None = None,
     ) -> bool:
         """
-        Add one IPv4 on ifname without flushing other addresses on that device.
+        Set one IPv4 on ifname without affecting other labeled addresses on the netdev.
 
-        For multi-IP / legacy alias interfaces (eth2:1, eth2:2): only removes remove_cidr
-        on the matching address label, then adds the target with the same label. Other
-        labeled addresses on the same netdev (e.g. heartbeat eth2:3) are not touched.
+        Uses ``ip addr replace`` (label-scoped) instead of ``del`` + ``add``. ``ip addr del``
+        does not support ``label``; a del on the shared netdev can remove the wrong address
+        or drop all aliases when the primary IPv4 is deleted (e.g. heartbeat eth2:3).
         """
         try:
             target = str(ipaddress.IPv4Interface(cidr.strip()))
@@ -399,17 +463,7 @@ class RuntimeManager:
                 logger.info("[热冗余] %s 已存在地址 %s，跳过添加", ifname, target)
                 return True
 
-            if remove_cidr:
-                remove = str(ipaddress.IPv4Interface(remove_cidr.strip()))
-                remove_ip = str(ipaddress.IPv4Interface(remove).ip)
-                for existing_cidr in cls._list_ipv4_cidrs_on_interface(ifname):
-                    if existing_cidr == remove or str(
-                        ipaddress.IPv4Interface(existing_cidr).ip
-                    ) == remove_ip:
-                        if not cls._ip_addr_del_on_interface(ifname, existing_cidr):
-                            return False
-
-            r = cls._ip_addr_add_on_interface(ifname, target)
+            r = cls._ip_addr_replace_on_interface(ifname, target)
             if r.returncode != 0:
                 err = (r.stderr or r.stdout or "").strip()
                 if "File exists" in err or "EEXIST" in err:
@@ -418,7 +472,7 @@ class RuntimeManager:
                         logger.info("[热冗余] %s 已存在地址 %s", ifname, target)
                         return True
                 logger.error(
-                    "[热冗余] ip addr add 失败 %s %s: %s",
+                    "[热冗余] ip addr replace 失败 %s %s: %s",
                     ifname,
                     target,
                     err,
@@ -428,13 +482,13 @@ class RuntimeManager:
             cls._link_set_interface_up(ifname)
             if remove_cidr:
                 logger.info(
-                    "[热冗余] %s 已切换地址：移除 %s，添加 %s",
+                    "[热冗余] %s 已切换地址：%s -> %s",
                     ifname,
                     str(ipaddress.IPv4Interface(remove_cidr.strip())),
                     target,
                 )
             else:
-                logger.info("[热冗余] 已为 %s 添加地址 %s", ifname, target)
+                logger.info("[热冗余] 已为 %s 设置地址 %s", ifname, target)
             return True
         except (ValueError, OSError, subprocess.TimeoutExpired) as e:
             logger.error("[热冗余] 配置 %s 地址异常: %s", ifname, e)
