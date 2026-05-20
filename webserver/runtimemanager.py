@@ -328,7 +328,7 @@ class RuntimeManager:
 
     @classmethod
     def _ip_addr_ifaddr_args(cls, cidr: str, netdev: str, address_label: str | None) -> list[str]:
-        """IFADDR + dev for add/replace (label is part of IFADDR, not valid on ``del``)."""
+        """IFADDR + dev for add (label is part of IFADDR, not valid on ``del``)."""
         args = [cidr, "dev", netdev]
         if address_label is not None:
             args.extend(["label", address_label])
@@ -402,17 +402,12 @@ class RuntimeManager:
             return False
 
     @classmethod
-    def _ip_addr_replace_on_interface(
+    def _ip_addr_add_on_interface(
         cls, ifname: str, cidr: str
     ) -> subprocess.CompletedProcess[str]:
-        """
-        Replace or add IPv4 on the given logical interface (netdev + optional label).
-
-        Prefer replace over del+add: ``ip addr del`` cannot scope by label and deleting
-        the primary IPv4 on a shared netdev can drop other labeled addresses.
-        """
+        """Add IPv4 on the given logical interface (netdev + optional label)."""
         prefix, netdev, address_label = cls._ip_addr_command_base(ifname)
-        cmd = [*prefix, "replace", *cls._ip_addr_ifaddr_args(cidr, netdev, address_label)]
+        cmd = [*prefix, "add", *cls._ip_addr_ifaddr_args(cidr, netdev, address_label)]
         return subprocess.run(
             cmd,
             check=False,
@@ -443,9 +438,9 @@ class RuntimeManager:
         """
         Set one IPv4 on ifname without affecting other labeled addresses on the netdev.
 
-        Uses ``ip addr replace`` (label-scoped) instead of ``del`` + ``add``. ``ip addr del``
-        does not support ``label``; a del on the shared netdev can remove the wrong address
-        or drop all aliases when the primary IPv4 is deleted (e.g. heartbeat eth2:3).
+        Uses ``ip addr del`` (or label-scoped flush) then ``ip addr add``. Plain ``ip addr del``
+        does not accept ``label``; labeled ifnames use flush-by-label via
+        ``_ip_addr_del_on_interface`` so other aliases on the same netdev stay intact.
         """
         try:
             target = str(ipaddress.IPv4Interface(cidr.strip()))
@@ -463,7 +458,20 @@ class RuntimeManager:
                 logger.info("[热冗余] %s 已存在地址 %s，跳过添加", ifname, target)
                 return True
 
-            r = cls._ip_addr_replace_on_interface(ifname, target)
+            if remove_cidr:
+                remove = str(ipaddress.IPv4Interface(remove_cidr.strip()))
+                remove_ip = str(ipaddress.IPv4Interface(remove).ip)
+                if remove_ip != target_ip:
+                    if not cls._ip_addr_del_on_interface(ifname, remove):
+                        logger.error(
+                            "[热冗余] ip addr del 失败 %s %s（中止添加 %s）",
+                            ifname,
+                            remove,
+                            target,
+                        )
+                        return False
+
+            r = cls._ip_addr_add_on_interface(ifname, target)
             if r.returncode != 0:
                 err = (r.stderr or r.stdout or "").strip()
                 if "File exists" in err or "EEXIST" in err:
@@ -472,7 +480,7 @@ class RuntimeManager:
                         logger.info("[热冗余] %s 已存在地址 %s", ifname, target)
                         return True
                 logger.error(
-                    "[热冗余] ip addr replace 失败 %s %s: %s",
+                    "[热冗余] ip addr add 失败 %s %s: %s",
                     ifname,
                     target,
                     err,
