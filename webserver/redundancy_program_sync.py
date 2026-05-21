@@ -61,6 +61,8 @@ def register_redundancy_sync_routes(runtime_manager: RuntimeManager) -> None:
         result = apply_program_zip_upload(runtime_manager, zip_bytes)
         if result.get("UploadFileFail"):
             return jsonify(result), 400
+        if (runtime_manager.is_redundancy and not runtime_manager.is_master):
+            logger.info("[热冗余][备机] 影子执行状态下已接收主机推送的 PLC 程序")
         return jsonify(result), 200
 
     @restapi_bp.route("/redundancy/sync-role-ini", methods=["POST"])

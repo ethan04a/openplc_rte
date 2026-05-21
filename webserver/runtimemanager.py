@@ -1,3 +1,4 @@
+import errno
 import ipaddress
 import json
 import os
@@ -655,6 +656,89 @@ class RuntimeManager:
                     entry.linux_ifname,
                 )
 
+    @staticmethod
+    def _normalize_ipv4_cidr(cidr: str) -> str:
+        return str(ipaddress.IPv4Interface(cidr.strip()))
+
+    def _permanent_master_cidrs_from_json(self) -> list[str] | None:
+        """Load permanent_master_ipv4_cidr list from redundancy_role.json only."""
+        if not self._redundancy_functional_nics:
+            return None
+        permanent = read_functional_cidrs_for_project(self._openplc_project_root())
+        if len(permanent) != len(self._redundancy_functional_nics) or not all(permanent):
+            return None
+        return [self._normalize_ipv4_cidr(str(c)) for c in permanent if c is not None]
+
+    def _functional_nic_cidr_matches_expected(self, ifname: str, expected_cidr: str) -> bool:
+        local_cidr = self._ipv4_cidr_for_interface(ifname)
+        if not local_cidr:
+            return False
+        try:
+            expected = self._normalize_ipv4_cidr(expected_cidr)
+            local = self._normalize_ipv4_cidr(local_cidr)
+        except ValueError:
+            return False
+        if local == expected:
+            return True
+        return str(ipaddress.IPv4Interface(local).ip) == str(
+            ipaddress.IPv4Interface(expected).ip
+        )
+
+    def _master_local_functional_cidrs_match_json(self) -> tuple[bool, list[str] | None]:
+        """
+        Compare each functional NIC's live CIDR to redundancy_role.json permanent_master_*.
+        Returns (all_match, expected_cidrs from JSON when loaded).
+        """
+        expected = self._permanent_master_cidrs_from_json()
+        if not expected:
+            return False, None
+        for entry, cidr in zip(self._redundancy_functional_nics, expected):
+            if not self._functional_nic_cidr_matches_expected(entry.linux_ifname, cidr):
+                return False, expected
+        return True, expected
+
+    def _ensure_master_functional_ips_match_json_after_heartbeat_send_error(
+        self, errno_value: int | None
+    ) -> None:
+        """
+        After redundancy TCP heartbeat send fails with ECONNRESET (104) or EPIPE (32):
+        compare live functional IPs to JSON; re-apply only if mismatched.
+        """
+        errno_label = "errno未知"
+        if errno_value == errno.ECONNRESET:
+            errno_label = "ECONNRESET(104)"
+        elif errno_value == errno.EPIPE:
+            errno_label = "EPIPE(32)"
+
+        match, expected = self._master_local_functional_cidrs_match_json()
+        if expected is None:
+            logger.warning(
+                "[热冗余][主机] 心跳发送异常(%s)后无法从 %s 读取有效的 functional_nics "
+                "permanent_master，跳过本机 IP 校验",
+                errno_label,
+                REDUNDANCY_ROLE_FILENAME,
+            )
+            return
+        if match:
+            logger.info(
+                "[热冗余][主机] 心跳发送异常(%s)后本机功能口 IP 与 %s 中 permanent_master 一致，无需重设",
+                errno_label,
+                REDUNDANCY_ROLE_FILENAME,
+            )
+            return
+        mismatches: list[str] = []
+        for entry, cidr in zip(self._redundancy_functional_nics, expected):
+            local = self._ipv4_cidr_for_interface(entry.linux_ifname) or "(无)"
+            if not self._functional_nic_cidr_matches_expected(entry.linux_ifname, cidr):
+                mismatches.append(f"{entry.linux_ifname}: 本机={local} JSON={cidr}")
+        logger.warning(
+            "[热冗余][主机] 心跳发送异常(%s)后本机功能口 IP 与 %s 不一致，将按 JSON 重设: %s",
+            errno_label,
+            REDUNDANCY_ROLE_FILENAME,
+            "; ".join(mismatches),
+        )
+        self._apply_master_functional_cidrs_locally(expected)
+
     def _clear_functional_lines_pending_sync(self) -> None:
         with self._functional_sync_lock:
             self._functional_lines_pending_sync = None
@@ -1198,6 +1282,7 @@ class RuntimeManager:
             return
         sock: socket.socket | None = None
         first_send_logged = False
+        master_hb_ever_connected = False
         while not self._heartbeat_stop.is_set():
             if sock is None:
                 try:
@@ -1206,6 +1291,27 @@ class RuntimeManager:
                     sock.bind((local_ip, 0))
                     sock.settimeout(10.0)
                     sock.connect((peer_ip, REDUNDANCY_HEARTBEAT_PORT))
+                    local_ep = sock.getsockname()
+                    if master_hb_ever_connected:
+                        logger.info(
+                            "[热冗余][主机] 已重新连接备机 TCP %s:%d（本机 %s:%d，冗余口 %s）。",
+                            peer_ip,
+                            REDUNDANCY_HEARTBEAT_PORT,
+                            local_ep[0],
+                            local_ep[1],
+                            self._redundancy_heartbeat_nic,
+                        )
+                    else:
+                        logger.info(
+                            "[热冗余][主机] 已成功连接备机 TCP %s:%d（本机 %s:%d，冗余口 %s）。",
+                            peer_ip,
+                            REDUNDANCY_HEARTBEAT_PORT,
+                            local_ep[0],
+                            local_ep[1],
+                            self._redundancy_heartbeat_nic,
+                        )
+                    master_hb_ever_connected = True
+                    first_send_logged = False
                     self._sync_functional_lines_after_tcp_connect(sock, sync_attempt_kind="on_connect")
                 except OSError as e:
                     logger.warning(
@@ -1234,6 +1340,11 @@ class RuntimeManager:
                     "[热冗余][主机] 发送 TCP 心跳失败，将断开并重连备机: %s",
                     e,
                 )
+                err_no = getattr(e, "errno", None)
+                if err_no in (errno.ECONNRESET, errno.EPIPE):
+                    self._ensure_master_functional_ips_match_json_after_heartbeat_send_error(
+                        err_no
+                    )
                 try:
                     sock.close()
                 except OSError:
@@ -1245,7 +1356,7 @@ class RuntimeManager:
 
             if not first_send_logged:
                 logger.info(
-                    "[热冗余][主机] 第一次开始发送 TCP 心跳包（对端=%s:%d，本机源地址=%s）。",
+                    "[热冗余][主机] 已开始向备机发送 TCP 心跳（对端=%s:%d，冗余口本机 IP=%s）。",
                     peer_ip,
                     REDUNDANCY_HEARTBEAT_PORT,
                     local_ip,
