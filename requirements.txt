@@ -11,3 +11,4 @@ pytest-flask
 pre-commit
 psutil; sys_platform != "cygwin"
 pyserial>=3.5
+paho-mqtt==2.1.0
