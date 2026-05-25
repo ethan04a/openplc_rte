@@ -855,7 +855,7 @@ int python_plugin_get_symbols(plugin_instance_t *plugin)
         // Construct the venv site-packages path
         char venv_site_packages[512];
         snprintf(venv_site_packages, sizeof(venv_site_packages), "%s/lib/python%d.%d/site-packages",
-                 plugin->config.venv_path, PY_MAJOR_VERSION, PY_MINOR_VERSION);
+                 plugin->config.venv_path, PY_MAJOR_VERSION, 10);
         // Get sys.path
         PyObject *sys_path = PySys_GetObject("path");
         if (sys_path && PyList_Check(sys_path))

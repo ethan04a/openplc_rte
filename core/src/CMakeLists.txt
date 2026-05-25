@@ -33,9 +33,16 @@ if(CMAKE_BUILD_TYPE STREQUAL "Release")
     add_compile_options(${COMMON_FLAGS} -O2 -Werror)
 endif()
 
-# Find Python development libraries
+# Embed Python 3.10 for plugin_driver.c venv site-packages (lib/python3.10/...).
+# Prefer /usr/local pkg-config (source-built 3.10); system python3-embed is often 3.9.
 find_package(PkgConfig REQUIRED)
-pkg_check_modules(PYTHON REQUIRED python3-embed)
+if(DEFINED ENV{PKG_CONFIG_PATH})
+    set(ENV{PKG_CONFIG_PATH} "/usr/local/lib/pkgconfig:$ENV{PKG_CONFIG_PATH}")
+else()
+    set(ENV{PKG_CONFIG_PATH} "/usr/local/lib/pkgconfig")
+endif()
+pkg_check_modules(PYTHON REQUIRED python-3.10-embed)
+message(STATUS "Python embed: ${PYTHON_VERSION} (${PYTHON_LIBRARIES})")
 
 # ===================== 头文件包含路径（放.h文件的地方） =====================
 # 【你添加自定义.h头文件】：如果有新的头文件目录，直接在这里加一行
@@ -84,6 +91,7 @@ add_executable(plc_main
 )
 
 # 链接库
+target_link_directories(plc_main PRIVATE /usr/local/lib)
 target_link_libraries(plc_main
     dl
     pthread
