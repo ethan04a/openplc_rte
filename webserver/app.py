@@ -346,6 +346,43 @@ def run_https():
         runtime_manager.stop()
 
 
+# def mqtt_test() -> None:
+#     """
+#     Subscribe to test/chatX; log incoming messages and publish an echo to test/chat.
+#     """
+#     from webserver.mqtt_publisher import MqttPublisher
+#     from webserver.mqtt_subscriber import MqttSubscriber
+
+#     mqtt_logger, _ = get_logger("mqtt_test", use_buffer=False)
+#     publisher = MqttPublisher(client_id="openplc-mqtt-test-pub")
+#     subscriber = MqttSubscriber(client_id="openplc-mqtt-test-sub")
+
+#     def on_message(topic: str, payload: bytes) -> None:
+#         text = payload.decode("utf-8", errors="replace")
+#         mqtt_logger.info("MQTT received on %s: %s", topic, text)
+#         reply = f"已经收到：{text}"
+#         if not publisher.publish("test/chat", reply):
+#             mqtt_logger.warning("MQTT failed to publish reply to test/chat")
+
+#     try:
+#         publisher.connect()
+#         subscriber.set_message_handler(on_message)
+#         subscriber.connect()
+#         if not subscriber.subscribe("test/chatX"):
+#             mqtt_logger.error("MQTT subscribe to test/chatX failed")
+#             publisher.disconnect()
+#             subscriber.disconnect()
+#             return
+#         mqtt_logger.info(
+#             "MQTT test running: subscribed to test/chatX, replies published to test/chat"
+#         )
+#     except (ConnectionError, TimeoutError, RuntimeError) as exc:
+#         mqtt_logger.error("MQTT test failed to start: %s", exc)
+#         publisher.disconnect()
+#         subscriber.disconnect()
+
+
 if __name__ == "__main__":
     run_sys_prepare_if_present()
+    #threading.Thread(target=mqtt_test, name="mqtt-test", daemon=True).start()
     run_https()
