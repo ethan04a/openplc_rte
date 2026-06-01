@@ -74,6 +74,8 @@ REDUNDANCY_IMAGE_UDP_ACK_HEADER = struct.Struct("!4sHBBQQQ")
 REDUNDANCY_IMAGE_UDP_PROTOCOL_VERSION_V2 = 2
 REDUNDANCY_IMAGE_UDP_ACK_HEADER_V2 = struct.Struct("!4sHBBQQQQ")
 REDUNDANCY_IMAGE_PHASE_SNAPSHOT_ASYNC = 0
+REDUNDANCY_IMAGE_PHASE_SCAN_END = 1
+REDUNDANCY_IMAGE_SCAN_END_WAIT_TIMEOUT_SEC = 1.0
 REDUNDANCY_IMAGE_UDP_ACK_LATENCY_EMA_ALPHA = 0.2
 
 REDUNDANCY_IMAGE_ACK_STATUS_OK = 0
@@ -132,20 +134,12 @@ class RedundancyImageUdpAck:
 
 @dataclass(frozen=True)
 class RedundancyImageFrameMetadata:
-    """
-    Per-frame sync metadata (phase 2).
-
-    scan_counter / tick / phase are placeholders until scan-cycle binding (phase 3+).
-    """
+    """Per-frame sync metadata attached to each UDP snapshot (phase 3: scan cycle end)."""
 
     scan_counter: int = 0
     tick: int = 0
-    phase: int = REDUNDANCY_IMAGE_PHASE_SNAPSHOT_ASYNC
+    phase: int = REDUNDANCY_IMAGE_PHASE_SCAN_END
     timestamp_ns: int = 0
-
-    @classmethod
-    def placeholder_now(cls) -> RedundancyImageFrameMetadata:
-        return cls(timestamp_ns=time.time_ns())
 
 
 @dataclass
@@ -173,6 +167,7 @@ class RedundancyImageUdpMasterStats:
     last_tick: int = 0
     last_phase: int = REDUNDANCY_IMAGE_PHASE_SNAPSHOT_ASYNC
     payload_crc32: int = 0
+    scan_end_timeout_count: int = 0
 
 
 @dataclass
@@ -668,7 +663,10 @@ def _redundancy_image_master_stats_to_dict(
 ) -> dict[str, Any]:
     data = asdict(stats)
     data["role"] = "master"
-    data["phase_name"] = "SNAPSHOT_ASYNC"
+    if data.get("last_phase") == REDUNDANCY_IMAGE_PHASE_SCAN_END:
+        data["phase_name"] = "SCAN_END"
+    else:
+        data["phase_name"] = "SNAPSHOT_ASYNC"
     return data
 
 
@@ -681,15 +679,20 @@ def _redundancy_image_sync_metadata_view(
         timestamp_ns = int(stats_payload.get("last_rx_timestamp_ns", 0))
     else:
         timestamp_ns = 0
+    phase = int(
+        stats_payload.get("last_phase", REDUNDANCY_IMAGE_PHASE_SNAPSHOT_ASYNC)
+    )
+    phase_name = (
+        "SCAN_END"
+        if phase == REDUNDANCY_IMAGE_PHASE_SCAN_END
+        else "SNAPSHOT_ASYNC"
+    )
     return {
         "scan_counter": int(stats_payload.get("last_scan_counter", 0)),
         "tick": int(stats_payload.get("last_tick", 0)),
-        "phase": int(
-            stats_payload.get("last_phase", REDUNDANCY_IMAGE_PHASE_SNAPSHOT_ASYNC)
-        ),
-        "phase_name": "SNAPSHOT_ASYNC",
+        "phase": phase,
+        "phase_name": phase_name,
         "timestamp_ns": timestamp_ns,
-        "note": "scan_counter/tick/phase are placeholders until phase 3",
     }
 
 
@@ -750,6 +753,7 @@ def _maybe_log_redundancy_image_udp_master_stats(
             stats.ack_latency_ema_ms,
             stats.consecutive_ack_miss_count,
             stats.last_ack_status_name,
+            stats.scan_end_timeout_count,
         )
 
 
@@ -842,6 +846,7 @@ class RuntimeManager:
             "enabled": self.is_redundancy,
             "role": role,
             "transport": "udp_fragment",
+            "sync_trigger": "scan_end" if self.is_master and self.is_redundancy else "n/a",
             "data_protocol_version": IMAGE_SNAPSHOT_PROTOCOL_VERSION,
             "ack_protocol_version": REDUNDANCY_IMAGE_UDP_PROTOCOL_VERSION_V2,
             "sync_port": REDUNDANCY_IMAGE_SYNC_PORT,
@@ -2271,7 +2276,7 @@ class RuntimeManager:
             logger.info("[热冗余][备机] TCP 心跳监听线程已退出。")
 
     def _redundancy_image_sync_master_loop(self) -> None:
-        """Push full I/O snapshots to standby over UDP frame fragments."""
+        """Push full I/O snapshots at each PLC scan cycle end (UDP frame fragments)."""
         standby_ip = self._redundancy_standby_ip
         local_ip = self._redundancy_local_heartbeat_ip
         if not standby_ip:
@@ -2290,10 +2295,11 @@ class RuntimeManager:
         dest = (standby_ip, REDUNDANCY_IMAGE_SYNC_PORT)
         session_id = self._next_redundancy_image_session_id()
         frame_seq = 0
+        last_scan_counter = 0
         udp_stats = self._image_udp_master_stats
         udp_stats.current_session_id = session_id
         logger.info(
-            "[hot-redundancy][master] UDP I/O image sync sender started "
+            "[hot-redundancy][master] UDP I/O image sync (scan-end driven) started "
             "(local=%s, peer=%s:%s, session=%s)",
             local_ip,
             standby_ip,
@@ -2314,10 +2320,28 @@ class RuntimeManager:
                             sock.getsockname()[1],
                         )
 
-                    payload = self.runtime_socket.image_snapshot_get()
-                    if not payload or len(payload) != IMAGE_SNAPSHOT_EXPECTED_BYTES:
-                        self._heartbeat_stop.wait(0.1)
+                    payload, scan_meta, scan_err = (
+                        self.runtime_socket.image_snapshot_get_scan_end(
+                            last_scan_counter, REDUNDANCY_IMAGE_SCAN_END_WAIT_TIMEOUT_SEC
+                        )
+                    )
+                    if scan_err == "scan_end_timeout":
+                        udp_stats.scan_end_timeout_count += 1
+                    if (
+                        not payload
+                        or scan_meta is None
+                        or len(payload) != IMAGE_SNAPSHOT_EXPECTED_BYTES
+                    ):
+                        self._heartbeat_stop.wait(0.05)
                         continue
+
+                    last_scan_counter = scan_meta.scan_counter
+                    frame_meta = RedundancyImageFrameMetadata(
+                        scan_counter=scan_meta.scan_counter,
+                        tick=scan_meta.tick,
+                        phase=scan_meta.phase,
+                        timestamp_ns=scan_meta.timestamp_ns,
+                    )
 
                     frame_seq = (frame_seq + 1) & ((1 << 64) - 1)
                     if frame_seq == 0:
@@ -2325,7 +2349,6 @@ class RuntimeManager:
                         udp_stats.current_session_id = session_id
                         frame_seq = 1
 
-                    frame_meta = RedundancyImageFrameMetadata.placeholder_now()
                     udp_stats.last_send_timestamp_ns = frame_meta.timestamp_ns
                     udp_stats.last_scan_counter = frame_meta.scan_counter
                     udp_stats.last_tick = frame_meta.tick
@@ -2407,7 +2430,6 @@ class RuntimeManager:
                             udp_stats.consecutive_ack_miss_count,
                         )
                     _maybe_log_redundancy_image_udp_master_stats(udp_stats)
-                    self._heartbeat_stop.wait(0.02)
                 except OSError as e:
                     logger.debug(
                         "[hot-redundancy][master] UDP I/O image sync error; reconnect: %s",

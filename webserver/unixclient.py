@@ -1,5 +1,6 @@
 import os
 import socket
+from dataclasses import dataclass
 from threading import Lock
 from typing import Optional
 
@@ -14,8 +15,45 @@ IMAGE_SNAPSHOT_PROTOCOL_VERSION = 1
 
 # unix_socket.c refuses snapshot I/O when plc_main is not PLC_STATE_RUNNING
 IMAGE_SNAPSHOT_GET_NOT_READY = "IMAGE_SNAPSHOT_GET:NOT_READY"
+IMAGE_SNAPSHOT_GET_SCAN_END_TIMEOUT = "IMAGE_SNAPSHOT_GET:SCAN_END_TIMEOUT"
 IMAGE_SNAPSHOT_SET_NOT_READY = "IMAGE_SNAPSHOT_SET:NOT_READY"
 IMAGE_SNAPSHOT_SET_NOT_SHADOW = "IMAGE_SNAPSHOT_SET:NOT_SHADOW"
+IMAGE_SNAPSHOT_PHASE_SCAN_END = 1
+
+
+@dataclass(frozen=True)
+class ImageSnapshotFrameMetadata:
+    scan_counter: int
+    tick: int
+    phase: int
+    timestamp_ns: int
+
+
+def _parse_image_snapshot_hdr_line(
+    line: str,
+) -> tuple[int, int, ImageSnapshotFrameMetadata | None] | None:
+    if not line.startswith("IMAGE_SNAPSHOT_HDR:"):
+        return None
+    parts = line.split(":")
+    if len(parts) < 3 or parts[0] != "IMAGE_SNAPSHOT_HDR":
+        return None
+    try:
+        ver = int(parts[1])
+        length = int(parts[2])
+    except ValueError:
+        return None
+    if len(parts) >= 7:
+        try:
+            meta = ImageSnapshotFrameMetadata(
+                scan_counter=int(parts[3]),
+                tick=int(parts[4]),
+                phase=int(parts[5]),
+                timestamp_ns=int(parts[6]),
+            )
+        except ValueError:
+            return None
+        return ver, length, meta
+    return ver, length, None
 
 
 def _recv_exact(sock: socket.socket, n: int, timeout: float | None) -> Optional[bytes]:
@@ -173,20 +211,14 @@ class SyncUnixClient:
             idx = buf.index(b"\n")
             line = buf[:idx].decode("utf-8", errors="replace").strip()
             rest = bytes(buf[idx + 1 :])
-            if line == IMAGE_SNAPSHOT_GET_NOT_READY:
-                logger.debug("IMAGE_SNAPSHOT_GET: NOT_READY (PLC not RUNNING)")
+            if line in (IMAGE_SNAPSHOT_GET_NOT_READY, IMAGE_SNAPSHOT_GET_SCAN_END_TIMEOUT):
+                logger.debug("IMAGE_SNAPSHOT_GET: %s", line.split(":", 1)[-1])
                 return None
-            if not line.startswith("IMAGE_SNAPSHOT_HDR:"):
+            parsed = _parse_image_snapshot_hdr_line(line)
+            if parsed is None:
                 logger.warning("IMAGE_SNAPSHOT_GET unexpected header: %s", line[:120])
                 return None
-            parts = line.split(":")
-            if len(parts) != 3 or parts[0] != "IMAGE_SNAPSHOT_HDR":
-                return None
-            try:
-                ver = int(parts[1])
-                length = int(parts[2])
-            except ValueError:
-                return None
+            ver, length, _meta = parsed
             if ver != IMAGE_SNAPSHOT_PROTOCOL_VERSION or length != IMAGE_SNAPSHOT_EXPECTED_BYTES:
                 logger.warning(
                     "IMAGE_SNAPSHOT_GET bad version/length: %s %s", ver, length
@@ -206,6 +238,78 @@ class SyncUnixClient:
                 # Extra bytes after snapshot should not happen; tolerate by leaving in socket buffer
                 pass
             return bytes(body)
+
+    def image_snapshot_get_scan_end(
+        self, after_scan_counter: int = 0, timeout: float = 1.0
+    ) -> tuple[Optional[bytes], Optional[ImageSnapshotFrameMetadata], Optional[str]]:
+        """
+        Wait for the next PLC scan cycle end, then export a full image snapshot.
+
+        Blocks in plc_main until scan_end_counter > after_scan_counter (or timeout).
+        """
+        if not self.sock:
+            raise RuntimeError("Socket not connected")
+
+        cmd = f"IMAGE_SNAPSHOT_GET_SCAN_END:{after_scan_counter}\n".encode("ascii")
+
+        with mutex:
+            try:
+                self.sock.settimeout(timeout)
+                self.sock.sendall(cmd)
+            except OSError as e:
+                self._invalidate_socket_locked()
+                logger.error("IMAGE_SNAPSHOT_GET_SCAN_END send failed: %s", e)
+                return None, None, "send_error"
+
+            buf = bytearray()
+            max_hdr = 256
+            while len(buf) < max_hdr:
+                try:
+                    chunk = self.sock.recv(65536)
+                except socket.timeout:
+                    logger.warning("IMAGE_SNAPSHOT_GET_SCAN_END header timeout")
+                    return None, None, "header_timeout"
+                if not chunk:
+                    self._invalidate_socket_locked()
+                    return None, None, "disconnected"
+                buf.extend(chunk)
+                if b"\n" in buf:
+                    break
+
+            idx = buf.index(b"\n")
+            line = buf[:idx].decode("utf-8", errors="replace").strip()
+            rest = bytes(buf[idx + 1 :])
+            if line == IMAGE_SNAPSHOT_GET_NOT_READY:
+                logger.debug("IMAGE_SNAPSHOT_GET_SCAN_END: NOT_READY")
+                return None, None, "not_ready"
+            if line == IMAGE_SNAPSHOT_GET_SCAN_END_TIMEOUT:
+                logger.debug("IMAGE_SNAPSHOT_GET_SCAN_END: SCAN_END_TIMEOUT")
+                return None, None, "scan_end_timeout"
+            parsed = _parse_image_snapshot_hdr_line(line)
+            if parsed is None:
+                logger.warning(
+                    "IMAGE_SNAPSHOT_GET_SCAN_END unexpected header: %s", line[:120]
+                )
+                return None, None, "bad_header"
+            ver, length, meta = parsed
+            if ver != IMAGE_SNAPSHOT_PROTOCOL_VERSION or length != IMAGE_SNAPSHOT_EXPECTED_BYTES:
+                logger.warning(
+                    "IMAGE_SNAPSHOT_GET_SCAN_END bad version/length: %s %s", ver, length
+                )
+                return None, None, "bad_header"
+            if meta is None:
+                logger.warning("IMAGE_SNAPSHOT_GET_SCAN_END missing scan metadata")
+                return None, None, "bad_header"
+
+            body = rest[:length]
+            if len(body) < length:
+                need = length - len(body)
+                extra = _recv_exact(self.sock, need, timeout)
+                if extra is None or len(extra) != need:
+                    self._invalidate_socket_locked()
+                    return None, None, "body_timeout"
+                body = body + extra
+            return bytes(body), meta, None
 
     def image_snapshot_set(self, payload: bytes, timeout: float = 5.0) -> tuple[bool, bool]:
         """Apply full I/O image on plc_main (standby shadow execution).

@@ -1,4 +1,5 @@
 #include <errno.h>
+#include <inttypes.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stdatomic.h>
@@ -15,6 +16,7 @@
 #include "plc_state_manager.h"
 #include "redundancy_ipc.h"
 #include "scan_cycle_manager.h"
+#include "scan_sync.h"
 #include "unix_socket.h"
 #include "utils/log.h"
 #include "utils/utils.h"
@@ -75,6 +77,56 @@ static int write_all(int fd, const void *buf, size_t len)
         off += (size_t)w;
     }
     return 0;
+}
+
+#define IMAGE_SNAPSHOT_SCAN_END_WAIT_MS 500
+
+static int send_image_snapshot_with_meta(int client_fd, const scan_sync_meta_t *meta)
+{
+    uint8_t *payload = malloc(IMAGE_SNAPSHOT_TOTAL_BYTES);
+    if (!payload)
+    {
+        const char *err = "IMAGE_SNAPSHOT_GET:ALLOC\n";
+        return write_all(client_fd, err, strlen(err));
+    }
+
+    size_t out_len = 0;
+    int exp_err;
+
+    plugin_mutex_take(&plugin_driver->buffer_mutex);
+    exp_err = image_snapshot_export(payload, IMAGE_SNAPSHOT_TOTAL_BYTES, &out_len);
+    plugin_mutex_give(&plugin_driver->buffer_mutex);
+
+    if (exp_err != 0 || out_len != IMAGE_SNAPSHOT_TOTAL_BYTES)
+    {
+        free(payload);
+        const char *err = "IMAGE_SNAPSHOT_GET:EXPORT_ERROR\n";
+        return write_all(client_fd, err, strlen(err));
+    }
+
+    char hdr[160];
+    if (meta)
+    {
+        snprintf(hdr, sizeof(hdr),
+                 "IMAGE_SNAPSHOT_HDR:%d:%zu:%" PRIu64 ":%lu:%u:%" PRIu64 "\n",
+                 IMAGE_SNAPSHOT_VERSION, (size_t)IMAGE_SNAPSHOT_TOTAL_BYTES,
+                 meta->scan_counter, meta->tick, (unsigned)meta->phase, meta->timestamp_ns);
+    }
+    else
+    {
+        snprintf(hdr, sizeof(hdr), "IMAGE_SNAPSHOT_HDR:%d:%zu\n", IMAGE_SNAPSHOT_VERSION,
+                 (size_t)IMAGE_SNAPSHOT_TOTAL_BYTES);
+    }
+
+    int rc = 0;
+    if (write_all(client_fd, hdr, strlen(hdr)) != 0 ||
+        write_all(client_fd, payload, IMAGE_SNAPSHOT_TOTAL_BYTES) != 0)
+    {
+        log_error("IMAGE_SNAPSHOT_GET: write failed");
+        rc = -1;
+    }
+    free(payload);
+    return rc;
 }
 
 void handle_unix_socket_commands(const char *command, char *response, size_t response_size)
@@ -229,43 +281,51 @@ void *unix_socket_thread(void *arg)
                         strncpy(response, "IMAGE_SNAPSHOT_GET:NOT_READY\n", MAX_RESPONSE_SIZE);
                         write_all(client_fd, response, strlen(response));
                     }
+                    else if (send_image_snapshot_with_meta(client_fd, NULL) != 0)
+                    {
+                        strncpy(response, "IMAGE_SNAPSHOT_GET:WRITE_ERROR\n", MAX_RESPONSE_SIZE);
+                        write_all(client_fd, response, strlen(response));
+                    }
+                }
+                else if (strncmp(command_buffer, "IMAGE_SNAPSHOT_GET_SCAN_END", 28) == 0 &&
+                         (command_buffer[28] == '\0' || command_buffer[28] == ':'))
+                {
+                    uint64_t after_counter = 0;
+
+                    if (command_buffer[28] == ':')
+                    {
+                        unsigned long long parsed = 0;
+                        if (sscanf(command_buffer + 29, "%llu", &parsed) == 1)
+                        {
+                            after_counter = (uint64_t)parsed;
+                        }
+                    }
+
+                    if (!plugin_driver)
+                    {
+                        strncpy(response, "IMAGE_SNAPSHOT_GET:NO_DRIVER\n", MAX_RESPONSE_SIZE);
+                        write_all(client_fd, response, strlen(response));
+                    }
+                    else if (plc_get_state() != PLC_STATE_RUNNING)
+                    {
+                        strncpy(response, "IMAGE_SNAPSHOT_GET:NOT_READY\n", MAX_RESPONSE_SIZE);
+                        write_all(client_fd, response, strlen(response));
+                    }
                     else
                     {
-                        uint8_t *payload = malloc(IMAGE_SNAPSHOT_TOTAL_BYTES);
-                        if (!payload)
+                        scan_sync_meta_t meta;
+                        if (scan_sync_wait_for_end(after_counter, IMAGE_SNAPSHOT_SCAN_END_WAIT_MS,
+                                                   &meta) != 0)
                         {
-                            strncpy(response, "IMAGE_SNAPSHOT_GET:ALLOC\n", MAX_RESPONSE_SIZE);
+                            strncpy(response, "IMAGE_SNAPSHOT_GET:SCAN_END_TIMEOUT\n",
+                                    MAX_RESPONSE_SIZE);
                             write_all(client_fd, response, strlen(response));
                         }
-                        else
+                        else if (send_image_snapshot_with_meta(client_fd, &meta) != 0)
                         {
-                            size_t out_len = 0;
-                            int exp_err;
-
-                            plugin_mutex_take(&plugin_driver->buffer_mutex);
-                            exp_err =
-                                image_snapshot_export(payload, IMAGE_SNAPSHOT_TOTAL_BYTES, &out_len);
-                            plugin_mutex_give(&plugin_driver->buffer_mutex);
-
-                            if (exp_err != 0 || out_len != IMAGE_SNAPSHOT_TOTAL_BYTES)
-                            {
-                                free(payload);
-                                strncpy(response, "IMAGE_SNAPSHOT_GET:EXPORT_ERROR\n",
-                                         MAX_RESPONSE_SIZE);
-                                write_all(client_fd, response, strlen(response));
-                            }
-                            else
-                            {
-                                char hdr[96];
-                                snprintf(hdr, sizeof(hdr), "IMAGE_SNAPSHOT_HDR:%d:%zu\n",
-                                         IMAGE_SNAPSHOT_VERSION, out_len);
-                                if (write_all(client_fd, hdr, strlen(hdr)) != 0 ||
-                                    write_all(client_fd, payload, out_len) != 0)
-                                {
-                                    log_error("IMAGE_SNAPSHOT_GET: write failed");
-                                }
-                                free(payload);
-                            }
+                            strncpy(response, "IMAGE_SNAPSHOT_GET:WRITE_ERROR\n",
+                                    MAX_RESPONSE_SIZE);
+                            write_all(client_fd, response, strlen(response));
                         }
                     }
                 }

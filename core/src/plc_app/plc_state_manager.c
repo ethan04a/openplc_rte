@@ -10,6 +10,7 @@
 #include "plc_state_manager.h"
 #include "plcapp_manager.h"
 #include "scan_cycle_manager.h"
+#include "scan_sync.h"
 #include "utils/log.h"
 #include "utils/utils.h"
 
@@ -187,6 +188,7 @@ void *plc_cycle_thread(void *arg)
         plugin_driver_cycle_start(plugin_driver);
 
         // Execute the PLC cycle
+        unsigned long cycle_tick = tick__;
         ext_config_run__(tick__++);
         ext_updateTime();
 
@@ -199,6 +201,7 @@ void *plc_cycle_thread(void *arg)
         plugin_mutex_give(&plugin_driver->buffer_mutex);
         holding_buffer_mutex = 0;
         scan_cycle_time_end();
+        scan_sync_notify_scan_end(cycle_tick);
 
         // Calculate next start time
         timer_start.tv_nsec += *ext_common_ticktime__;

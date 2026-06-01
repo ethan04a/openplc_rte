@@ -17,6 +17,7 @@
 #include "plc_state_manager.h"
 #include "plcapp_manager.h"
 #include "scan_cycle_manager.h"
+#include "scan_sync.h"
 #include "unix_socket.h"
 #include "utils/log.h"
 #include "utils/utils.h"
@@ -72,6 +73,8 @@ int main(int argc, char *argv[])
     {
         log_set_level(LOG_LEVEL_DEBUG);
     }
+
+    scan_sync_init();
 
     if (log_init(LOG_SOCKET_PATH) < 0)
     {

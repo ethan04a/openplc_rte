@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
-from webserver.unixclient import IMAGE_SNAPSHOT_PROTOCOL_VERSION
+from webserver.unixclient import (
+    IMAGE_SNAPSHOT_EXPECTED_BYTES,
+    IMAGE_SNAPSHOT_PROTOCOL_VERSION,
+    _parse_image_snapshot_hdr_line,
+)
 
 from webserver.runtimemanager import (
-    IMAGE_SNAPSHOT_EXPECTED_BYTES,
+    REDUNDANCY_IMAGE_PHASE_SCAN_END,
     REDUNDANCY_IMAGE_UDP_ACK_HEADER,
     REDUNDANCY_IMAGE_ACK_STATUS_BAD_HEADER,
     REDUNDANCY_IMAGE_ACK_STATUS_CRC_ERROR,
@@ -47,6 +51,29 @@ def _fragments_from_payload(session_id: int, frame_seq: int, payload: bytes):
         assert fragment is not None
         fragments.append(fragment)
     return fragments
+
+
+def test_parse_extended_image_snapshot_hdr():
+    line = f"IMAGE_SNAPSHOT_HDR:1:{IMAGE_SNAPSHOT_EXPECTED_BYTES}:42:100:1:999\n"
+    parsed = _parse_image_snapshot_hdr_line(line.strip())
+    assert parsed is not None
+    ver, length, meta = parsed
+    assert ver == 1
+    assert length == IMAGE_SNAPSHOT_EXPECTED_BYTES
+    assert meta is not None
+    assert meta.scan_counter == 42
+    assert meta.tick == 100
+    assert meta.phase == REDUNDANCY_IMAGE_PHASE_SCAN_END
+    assert meta.timestamp_ns == 999
+
+
+def test_parse_legacy_image_snapshot_hdr():
+    line = f"IMAGE_SNAPSHOT_HDR:1:{IMAGE_SNAPSHOT_EXPECTED_BYTES}\n"
+    parsed = _parse_image_snapshot_hdr_line(line.strip())
+    assert parsed is not None
+    ver, length, meta = parsed
+    assert meta is None
+    assert length == IMAGE_SNAPSHOT_EXPECTED_BYTES
 
 
 def test_fragment_count_for_full_snapshot():
@@ -249,11 +276,13 @@ def test_udp_ack_v2_roundtrip():
     assert ack.ack_frame_seq == 12
 
 
-def test_frame_metadata_placeholder():
-    meta = RedundancyImageFrameMetadata.placeholder_now()
-    assert meta.scan_counter == 0
-    assert meta.tick == 0
-    assert meta.timestamp_ns > 0
+def test_frame_metadata_defaults():
+    meta = RedundancyImageFrameMetadata(
+        scan_counter=10, tick=20, phase=REDUNDANCY_IMAGE_PHASE_SCAN_END, timestamp_ns=1
+    )
+    assert meta.scan_counter == 10
+    assert meta.tick == 20
+    assert meta.phase == REDUNDANCY_IMAGE_PHASE_SCAN_END
 
 
 def test_master_ack_latency_recording():
