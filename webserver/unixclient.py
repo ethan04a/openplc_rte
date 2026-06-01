@@ -359,7 +359,7 @@ class SyncUnixClient:
                     break
             line_end = buf.index(b"\n")
             resp = buf[:line_end].decode("utf-8", errors="replace").strip()
-            if resp == "IMAGE_SNAPSHOT_SET:OK":
+            if resp in ("IMAGE_SNAPSHOT_SET:OK", "IMAGE_SNAPSHOT_SET:QUEUED"):
                 return (True, False)
             if resp == IMAGE_SNAPSHOT_SET_NOT_READY:
                 logger.debug("IMAGE_SNAPSHOT_SET: NOT_READY (PLC not RUNNING)")

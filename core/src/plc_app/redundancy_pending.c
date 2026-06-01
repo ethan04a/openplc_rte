@@ -5,6 +5,7 @@
 
 #include "image_snapshot.h"
 #include "image_snapshot_delta.h"
+#include "scan_sync.h"
 #include "../drivers/plugin_driver.h"
 
 void redundancy_udp_note_applied(uint64_t seq);
@@ -33,6 +34,42 @@ void redundancy_pending_set_frame_seq(uint64_t seq)
     pthread_mutex_lock(&pending_mutex);
     pending_frame_seq = seq;
     pthread_mutex_unlock(&pending_mutex);
+}
+
+uint64_t redundancy_pending_alloc_frame_seq(void)
+{
+    uint64_t seq;
+    pthread_mutex_lock(&pending_mutex);
+    pending_frame_seq++;
+    seq = pending_frame_seq;
+    pthread_mutex_unlock(&pending_mutex);
+    return seq;
+}
+
+int redundancy_pending_wait_applied(uint64_t want, int timeout_ms)
+{
+    uint64_t start_seen = scan_sync_get_start_counter();
+    int attempts        = 0;
+    int per_wait        = timeout_ms > 0 ? timeout_ms / 8 : 200;
+    if (per_wait < 50)
+    {
+        per_wait = 50;
+    }
+
+    if (redundancy_pending_last_applied_seq() >= want)
+    {
+        return 0;
+    }
+    while (attempts < 8 && redundancy_pending_last_applied_seq() < want)
+    {
+        if (scan_sync_wait_for_start(start_seen, per_wait) != 0)
+        {
+            break;
+        }
+        start_seen = scan_sync_get_start_counter();
+        attempts++;
+    }
+    return redundancy_pending_last_applied_seq() >= want ? 0 : -1;
 }
 
 int redundancy_pending_store(const uint8_t *buf, size_t len)

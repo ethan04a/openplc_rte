@@ -485,37 +485,22 @@ void *unix_socket_thread(void *arg)
                 else if (strncmp(command_buffer, "IMAGE_SYNC_WAIT_APPLIED:", 24) == 0)
                 {
                     unsigned long long want = 0;
-                    uint64_t start_seen     = scan_sync_get_start_counter();
-                    int attempts            = 0;
 
                     if (sscanf(command_buffer + 24, "%llu", &want) != 1)
                     {
                         strncpy(response, "IMAGE_SYNC_WAIT_APPLIED:HDR_ERROR\n", MAX_RESPONSE_SIZE);
                         write_all(client_fd, response, strlen(response));
                     }
+                    else if (redundancy_pending_wait_applied((uint64_t)want, 1600) == 0)
+                    {
+                        strncpy(response, "IMAGE_SYNC_WAIT_APPLIED:OK\n", MAX_RESPONSE_SIZE);
+                        write_all(client_fd, response, strlen(response));
+                    }
                     else
                     {
-                        while (attempts < 8 &&
-                               redundancy_pending_last_applied_seq() < want)
-                        {
-                            if (scan_sync_wait_for_start(start_seen, 200) != 0)
-                            {
-                                break;
-                            }
-                            start_seen = scan_sync_get_start_counter();
-                            attempts++;
-                        }
-                        if (redundancy_pending_last_applied_seq() >= want)
-                        {
-                            strncpy(response, "IMAGE_SYNC_WAIT_APPLIED:OK\n", MAX_RESPONSE_SIZE);
-                            write_all(client_fd, response, strlen(response));
-                        }
-                        else
-                        {
-                            strncpy(response, "IMAGE_SYNC_WAIT_APPLIED:TIMEOUT\n",
-                                    MAX_RESPONSE_SIZE);
-                            write_all(client_fd, response, strlen(response));
-                        }
+                        strncpy(response, "IMAGE_SYNC_WAIT_APPLIED:TIMEOUT\n",
+                                MAX_RESPONSE_SIZE);
+                        write_all(client_fd, response, strlen(response));
                     }
                 }
                 else if (strncmp(command_buffer, "IMAGE_SNAPSHOT_SET:", 19) == 0)
@@ -558,21 +543,18 @@ void *unix_socket_thread(void *arg)
                         }
                         else
                         {
-                            int imp_err;
-
-                            plugin_mutex_take(&plugin_driver->buffer_mutex);
-                            imp_err = image_snapshot_import(payload, (size_t)sz);
-                            plugin_mutex_give(&plugin_driver->buffer_mutex);
-                            free(payload);
-
-                            if (imp_err != 0)
+                            (void)redundancy_pending_alloc_frame_seq();
+                            if (redundancy_pending_store(payload, (size_t)sz) != 0)
                             {
-                                strncpy(response, "IMAGE_SNAPSHOT_SET:IMPORT_ERROR\n",
+                                free(payload);
+                                strncpy(response, "IMAGE_SNAPSHOT_SET:STORE_ERROR\n",
                                         MAX_RESPONSE_SIZE);
                             }
                             else
                             {
-                                strncpy(response, "IMAGE_SNAPSHOT_SET:OK\n", MAX_RESPONSE_SIZE);
+                                free(payload);
+                                strncpy(response, "IMAGE_SNAPSHOT_SET:QUEUED\n",
+                                        MAX_RESPONSE_SIZE);
                             }
                             write_all(client_fd, response, strlen(response));
                         }

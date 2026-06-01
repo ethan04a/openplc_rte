@@ -20,4 +20,13 @@ uint64_t redundancy_pending_last_applied_seq(void);
 
 void redundancy_pending_set_frame_seq(uint64_t seq);
 
+/** Allocate monotonic frame_seq for legacy IMAGE_SNAPSHOT_SET on shadow standby. */
+uint64_t redundancy_pending_alloc_frame_seq(void);
+
+/**
+ * Wait until last_applied_frame_seq >= want (barrier apply), or timeout.
+ * Returns 0 on success, -1 on timeout.
+ */
+int redundancy_pending_wait_applied(uint64_t want, int timeout_ms);
+
 #endif /* REDUNDANCY_PENDING_H */
