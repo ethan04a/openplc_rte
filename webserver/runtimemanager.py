@@ -843,6 +843,25 @@ class RuntimeManager:
         self._image_udp_stats_lock = threading.Lock()
         self._plc_image_data_plane_active = False
 
+    def _fetch_plc_redundancy_sync_status(self) -> dict[str, Any]:
+        """Read plc_main REDUNDANCY_SYNC_STATUS when the C UDP data plane is active."""
+        try:
+            if not self.runtime_socket.is_connected():
+                self._safe_connect_runtime_socket()
+            self.runtime_socket.send_message("REDUNDANCY_SYNC_STATUS\n")
+            resp = self.runtime_socket.recv_message(timeout=1.0)
+        except (OSError, RuntimeError, json.JSONDecodeError) as e:
+            logger.debug("[hot-redundancy] REDUNDANCY_SYNC_STATUS failed: %s", e)
+            return {}
+        if not resp or "REDUNDANCY_SYNC_STATUS:" not in resp:
+            return {}
+        prefix = "REDUNDANCY_SYNC_STATUS:"
+        idx = resp.find(prefix)
+        body = resp[idx + len(prefix) :].strip()
+        if not body.startswith("{"):
+            return {}
+        return json.loads(body)
+
     def get_redundancy_image_sync_status(self) -> dict[str, Any]:
         """
         Phase 2 observability: UDP I/O image sync counters and latency (REDUNDANCY_SYNC_STATUS).
@@ -861,6 +880,9 @@ class RuntimeManager:
             else:
                 stats_payload = {}
                 role = "none"
+        plc_sync_stats: dict[str, Any] = {}
+        if self._plc_image_data_plane_active:
+            plc_sync_stats = self._fetch_plc_redundancy_sync_status()
         return {
             "enabled": self.is_redundancy,
             "role": role,
@@ -883,6 +905,7 @@ class RuntimeManager:
             "plc_running": self._plc_runtime_is_running(),
             "metadata": _redundancy_image_sync_metadata_view(stats_payload, role),
             "stats": stats_payload,
+            "plc_sync": plc_sync_stats,
             "updated_monotonic": time.monotonic(),
         }
 
