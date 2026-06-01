@@ -13,8 +13,11 @@
 #include "../drivers/plugin_driver.h"
 #include "debug_handler.h"
 #include "image_snapshot.h"
+#include "image_snapshot_delta.h"
 #include "plc_state_manager.h"
 #include "redundancy_ipc.h"
+#include "redundancy_pending.h"
+#include "redundancy_udp.h"
 #include "scan_cycle_manager.h"
 #include "scan_sync.h"
 #include "unix_socket.h"
@@ -129,6 +132,40 @@ static int send_image_snapshot_with_meta(int client_fd, const scan_sync_meta_t *
     return rc;
 }
 
+static int send_image_delta_scan_end(int client_fd, uint64_t after_counter)
+{
+    scan_sync_meta_t meta;
+    uint8_t buf[IMAGE_DELTA_MAX_WIRE_BYTES + 64];
+    size_t len = 0;
+    char hdr[64];
+
+    if (!plugin_driver || plc_get_state() != PLC_STATE_RUNNING)
+    {
+        return -1;
+    }
+    if (scan_sync_wait_for_end(after_counter, IMAGE_SNAPSHOT_SCAN_END_WAIT_MS, &meta) != 0)
+    {
+        const char *err = "IMAGE_DELTA_GET:SCAN_END_TIMEOUT\n";
+        return write_all(client_fd, err, strlen(err));
+    }
+
+    plugin_mutex_take(&plugin_driver->buffer_mutex);
+    if (image_delta_export_scan_end(buf, sizeof(buf), &len, &meta) != 0)
+    {
+        plugin_mutex_give(&plugin_driver->buffer_mutex);
+        const char *err = "IMAGE_DELTA_GET:EXPORT_ERROR\n";
+        return write_all(client_fd, err, strlen(err));
+    }
+    plugin_mutex_give(&plugin_driver->buffer_mutex);
+
+    snprintf(hdr, sizeof(hdr), "IMAGE_DELTA_HDR:%zu\n", len);
+    if (write_all(client_fd, hdr, strlen(hdr)) != 0 || write_all(client_fd, buf, len) != 0)
+    {
+        return -1;
+    }
+    return 0;
+}
+
 void handle_unix_socket_commands(const char *command, char *response, size_t response_size)
 {
     if (strcmp(command, "PING") == 0)
@@ -213,6 +250,40 @@ void handle_unix_socket_commands(const char *command, char *response, size_t res
     else if (strcmp(command, "REDUNDANCY_SHADOW_EXIT") == 0)
     {
         redundancy_shadow_exit_response(response, response_size);
+    }
+    else if (strncmp(command, "REDUNDANCY_SYNC_CONFIG:", 22) == 0)
+    {
+        if (redundancy_udp_configure(command + 22) == 0)
+        {
+            strncpy(response, "REDUNDANCY_SYNC_CONFIG:OK\n", response_size);
+        }
+        else
+        {
+            strncpy(response, "REDUNDANCY_SYNC_CONFIG:ERROR\n", response_size);
+        }
+    }
+    else if (strcmp(command, "REDUNDANCY_SYNC_START") == 0)
+    {
+        if (redundancy_udp_start() == 0)
+        {
+            strncpy(response, "REDUNDANCY_SYNC_START:OK\n", response_size);
+        }
+        else
+        {
+            strncpy(response, "REDUNDANCY_SYNC_START:ERROR\n", response_size);
+        }
+    }
+    else if (strcmp(command, "REDUNDANCY_SYNC_STOP") == 0)
+    {
+        redundancy_udp_stop();
+        strncpy(response, "REDUNDANCY_SYNC_STOP:OK\n", response_size);
+    }
+    else if (strcmp(command, "REDUNDANCY_SYNC_STATUS") == 0)
+    {
+        if (redundancy_udp_format_status(response, response_size) != 0)
+        {
+            strncpy(response, "REDUNDANCY_SYNC_STATUS:ERROR\n", response_size);
+        }
     }
     else
     {
@@ -324,6 +395,124 @@ void *unix_socket_thread(void *arg)
                         else if (send_image_snapshot_with_meta(client_fd, &meta) != 0)
                         {
                             strncpy(response, "IMAGE_SNAPSHOT_GET:WRITE_ERROR\n",
+                                    MAX_RESPONSE_SIZE);
+                            write_all(client_fd, response, strlen(response));
+                        }
+                    }
+                }
+                else if (strncmp(command_buffer, "IMAGE_DELTA_GET_SCAN_END", 24) == 0 &&
+                         (command_buffer[24] == '\0' || command_buffer[24] == ':'))
+                {
+                    uint64_t after_counter = 0;
+                    if (command_buffer[24] == ':')
+                    {
+                        unsigned long long parsed = 0;
+                        if (sscanf(command_buffer + 25, "%llu", &parsed) == 1)
+                        {
+                            after_counter = (uint64_t)parsed;
+                        }
+                    }
+                    if (!plugin_driver)
+                    {
+                        strncpy(response, "IMAGE_DELTA_GET:NO_DRIVER\n", MAX_RESPONSE_SIZE);
+                        write_all(client_fd, response, strlen(response));
+                    }
+                    else if (plc_get_state() != PLC_STATE_RUNNING)
+                    {
+                        strncpy(response, "IMAGE_DELTA_GET:NOT_READY\n", MAX_RESPONSE_SIZE);
+                        write_all(client_fd, response, strlen(response));
+                    }
+                    else if (send_image_delta_scan_end(client_fd, after_counter) != 0)
+                    {
+                        strncpy(response, "IMAGE_DELTA_GET:WRITE_ERROR\n", MAX_RESPONSE_SIZE);
+                        write_all(client_fd, response, strlen(response));
+                    }
+                }
+                else if (strncmp(command_buffer, "IMAGE_SYNC_PENDING_SET:", 23) == 0)
+                {
+                    unsigned long long frame_seq = 0;
+                    unsigned long sz             = 0;
+                    if (sscanf(command_buffer + 23, "%llu:%lu", &frame_seq, &sz) != 2 ||
+                        !plugin_driver || sz == 0 || sz > REDUNDANCY_PENDING_MAX_BYTES)
+                    {
+                        strncpy(response, "IMAGE_SYNC_PENDING_SET:HDR_ERROR\n", MAX_RESPONSE_SIZE);
+                        write_all(client_fd, response, strlen(response));
+                    }
+                    else
+                    {
+                        uint8_t *payload = malloc((size_t)sz);
+                        if (!payload || read_exact(client_fd, payload, (size_t)sz) != 0)
+                        {
+                            free(payload);
+                            strncpy(response, "IMAGE_SYNC_PENDING_SET:READ_ERROR\n",
+                                    MAX_RESPONSE_SIZE);
+                            write_all(client_fd, response, strlen(response));
+                        }
+                        else if (plc_get_state() != PLC_STATE_RUNNING)
+                        {
+                            free(payload);
+                            strncpy(response, "IMAGE_SYNC_PENDING_SET:NOT_READY\n",
+                                    MAX_RESPONSE_SIZE);
+                            write_all(client_fd, response, strlen(response));
+                        }
+                        else if (!plugin_driver->shadow_standby)
+                        {
+                            free(payload);
+                            strncpy(response, "IMAGE_SYNC_PENDING_SET:NOT_SHADOW\n",
+                                    MAX_RESPONSE_SIZE);
+                            write_all(client_fd, response, strlen(response));
+                        }
+                        else
+                        {
+                            redundancy_pending_set_frame_seq((uint64_t)frame_seq);
+                            if (redundancy_pending_store(payload, (size_t)sz) != 0)
+                            {
+                                free(payload);
+                                strncpy(response, "IMAGE_SYNC_PENDING_SET:STORE_ERROR\n",
+                                        MAX_RESPONSE_SIZE);
+                                write_all(client_fd, response, strlen(response));
+                            }
+                            else
+                            {
+                                free(payload);
+                                strncpy(response, "IMAGE_SYNC_PENDING_SET:QUEUED\n",
+                                        MAX_RESPONSE_SIZE);
+                                write_all(client_fd, response, strlen(response));
+                            }
+                        }
+                    }
+                }
+                else if (strncmp(command_buffer, "IMAGE_SYNC_WAIT_APPLIED:", 24) == 0)
+                {
+                    unsigned long long want = 0;
+                    uint64_t start_seen     = scan_sync_get_start_counter();
+                    int attempts            = 0;
+
+                    if (sscanf(command_buffer + 24, "%llu", &want) != 1)
+                    {
+                        strncpy(response, "IMAGE_SYNC_WAIT_APPLIED:HDR_ERROR\n", MAX_RESPONSE_SIZE);
+                        write_all(client_fd, response, strlen(response));
+                    }
+                    else
+                    {
+                        while (attempts < 8 &&
+                               redundancy_pending_last_applied_seq() < want)
+                        {
+                            if (scan_sync_wait_for_start(start_seen, 200) != 0)
+                            {
+                                break;
+                            }
+                            start_seen = scan_sync_get_start_counter();
+                            attempts++;
+                        }
+                        if (redundancy_pending_last_applied_seq() >= want)
+                        {
+                            strncpy(response, "IMAGE_SYNC_WAIT_APPLIED:OK\n", MAX_RESPONSE_SIZE);
+                            write_all(client_fd, response, strlen(response));
+                        }
+                        else
+                        {
+                            strncpy(response, "IMAGE_SYNC_WAIT_APPLIED:TIMEOUT\n",
                                     MAX_RESPONSE_SIZE);
                             write_all(client_fd, response, strlen(response));
                         }

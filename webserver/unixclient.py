@@ -19,6 +19,7 @@ IMAGE_SNAPSHOT_GET_SCAN_END_TIMEOUT = "IMAGE_SNAPSHOT_GET:SCAN_END_TIMEOUT"
 IMAGE_SNAPSHOT_SET_NOT_READY = "IMAGE_SNAPSHOT_SET:NOT_READY"
 IMAGE_SNAPSHOT_SET_NOT_SHADOW = "IMAGE_SNAPSHOT_SET:NOT_SHADOW"
 IMAGE_SNAPSHOT_PHASE_SCAN_END = 1
+IMAGE_DELTA_MAGIC = b"OPDL"
 
 
 @dataclass(frozen=True)
@@ -419,6 +420,82 @@ class SyncUnixClient:
             except Exception:
                 self._invalidate_socket_locked()
                 return None
+
+    def image_delta_get_scan_end(
+        self, after_scan_counter: int = 0, timeout: float = 1.0
+    ) -> tuple[Optional[bytes], Optional[str]]:
+        if not self.sock:
+            raise RuntimeError("Socket not connected")
+        cmd = f"IMAGE_DELTA_GET_SCAN_END:{after_scan_counter}\n".encode("ascii")
+        with mutex:
+            try:
+                self.sock.settimeout(timeout)
+                self.sock.sendall(cmd)
+            except OSError as e:
+                self._invalidate_socket_locked()
+                logger.error("IMAGE_DELTA_GET_SCAN_END send failed: %s", e)
+                return None, "send_error"
+            buf = bytearray()
+            while len(buf) < 256:
+                try:
+                    chunk = self.sock.recv(65536)
+                except socket.timeout:
+                    return None, "header_timeout"
+                if not chunk:
+                    self._invalidate_socket_locked()
+                    return None, "disconnected"
+                buf.extend(chunk)
+                if b"\n" in buf:
+                    break
+            idx = buf.index(b"\n")
+            line = buf[:idx].decode("utf-8", errors="replace").strip()
+            rest = bytes(buf[idx + 1 :])
+            if line in (IMAGE_SNAPSHOT_GET_NOT_READY, IMAGE_SNAPSHOT_GET_SCAN_END_TIMEOUT):
+                return None, line.split(":", 1)[-1].lower()
+            if not line.startswith("IMAGE_DELTA_HDR:"):
+                return None, "bad_header"
+            try:
+                length = int(line.split(":", 1)[1])
+            except ValueError:
+                return None, "bad_header"
+            body = rest[:length]
+            if len(body) < length:
+                extra = _recv_exact(self.sock, length - len(body), timeout)
+                if extra is None:
+                    self._invalidate_socket_locked()
+                    return None, "body_timeout"
+                body += extra
+            return bytes(body), None
+
+    def image_sync_pending_set(self, frame_seq: int, payload: bytes, timeout: float = 5.0) -> bool:
+        if not self.sock:
+            raise RuntimeError("Socket not connected")
+        hdr = f"IMAGE_SYNC_PENDING_SET:{frame_seq}:{len(payload)}\n".encode("ascii")
+        with mutex:
+            try:
+                self.sock.settimeout(timeout)
+                self.sock.sendall(hdr)
+                self.sock.sendall(payload)
+            except OSError as e:
+                self._invalidate_socket_locked()
+                logger.error("IMAGE_SYNC_PENDING_SET send failed: %s", e)
+                return False
+            resp = self.recv_message(timeout=timeout)
+            return bool(resp and "IMAGE_SYNC_PENDING_SET:QUEUED" in resp)
+
+    def image_sync_wait_applied(self, frame_seq: int, timeout: float = 1.0) -> bool:
+        if not self.sock:
+            raise RuntimeError("Socket not connected")
+        with mutex:
+            try:
+                self.sock.settimeout(timeout)
+                self.sock.sendall(f"IMAGE_SYNC_WAIT_APPLIED:{frame_seq}\n".encode("ascii"))
+            except OSError as e:
+                self._invalidate_socket_locked()
+                logger.error("IMAGE_SYNC_WAIT_APPLIED send failed: %s", e)
+                return False
+            resp = self.recv_message(timeout=timeout)
+            return bool(resp and "IMAGE_SYNC_WAIT_APPLIED:OK" in resp)
 
     def close(self):
         with mutex:

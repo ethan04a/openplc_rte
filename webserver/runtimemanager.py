@@ -76,6 +76,8 @@ REDUNDANCY_IMAGE_UDP_ACK_HEADER_V2 = struct.Struct("!4sHBBQQQQ")
 REDUNDANCY_IMAGE_PHASE_SNAPSHOT_ASYNC = 0
 REDUNDANCY_IMAGE_PHASE_SCAN_END = 1
 REDUNDANCY_IMAGE_SCAN_END_WAIT_TIMEOUT_SEC = 1.0
+REDUNDANCY_IMAGE_DELTA_MAGIC = b"OPDL"
+REDUNDANCY_IMAGE_DELTA_MAX_WIRE_BYTES = 1100
 REDUNDANCY_IMAGE_UDP_ACK_LATENCY_EMA_ALPHA = 0.2
 
 REDUNDANCY_IMAGE_ACK_STATUS_OK = 0
@@ -224,13 +226,29 @@ def _redundancy_image_fragment_count(total_len: int) -> int:
     )
 
 
+def _is_redundancy_delta_payload(payload: bytes) -> bool:
+    return len(payload) >= 4 and payload[:4] == REDUNDANCY_IMAGE_DELTA_MAGIC
+
+
+def _parse_delta_wire_metadata(payload: bytes) -> RedundancyImageFrameMetadata | None:
+    if not _is_redundancy_delta_payload(payload) or len(payload) < 44:
+        return None
+    scan_counter, tick_u64, phase, _changed, timestamp_ns = struct.unpack_from(
+        "<QQB3xIQ", payload, 8
+    )
+    return RedundancyImageFrameMetadata(
+        scan_counter=int(scan_counter),
+        tick=int(tick_u64),
+        phase=int(phase),
+        timestamp_ns=int(timestamp_ns),
+    )
+
+
 def _iter_redundancy_image_udp_fragments(
     session_id: int, frame_seq: int, payload: bytes
 ) -> list[bytes]:
-    if len(payload) != IMAGE_SNAPSHOT_EXPECTED_BYTES:
-        raise ValueError(
-            f"snapshot size {len(payload)} != {IMAGE_SNAPSHOT_EXPECTED_BYTES}"
-        )
+    if len(payload) == 0 or len(payload) > IMAGE_SNAPSHOT_EXPECTED_BYTES:
+        raise ValueError(f"invalid sync payload size {len(payload)}")
     fragment_count = _redundancy_image_fragment_count(len(payload))
     if fragment_count > 0xFFFF:
         raise ValueError("snapshot requires too many UDP fragments")
@@ -284,7 +302,7 @@ def _parse_redundancy_image_udp_fragment(
         or reserved != REDUNDANCY_IMAGE_UDP_RESERVED
     ):
         return None, REDUNDANCY_IMAGE_ACK_STATUS_BAD_HEADER
-    if total_len != IMAGE_SNAPSHOT_EXPECTED_BYTES or fragment_count == 0:
+    if total_len == 0 or total_len > IMAGE_SNAPSHOT_EXPECTED_BYTES or fragment_count == 0:
         return None, REDUNDANCY_IMAGE_ACK_STATUS_BAD_HEADER
     if fragment_index >= fragment_count:
         return None, REDUNDANCY_IMAGE_ACK_STATUS_BAD_HEADER
@@ -823,6 +841,7 @@ class RuntimeManager:
         self._image_udp_master_stats = RedundancyImageUdpMasterStats()
         self._image_udp_standby_stats = RedundancyImageUdpStandbyStats()
         self._image_udp_stats_lock = threading.Lock()
+        self._plc_image_data_plane_active = False
 
     def get_redundancy_image_sync_status(self) -> dict[str, Any]:
         """
@@ -847,6 +866,10 @@ class RuntimeManager:
             "role": role,
             "transport": "udp_fragment",
             "sync_trigger": "scan_end" if self.is_master and self.is_redundancy else "n/a",
+            "data_plane": (
+                "plc_main" if self._plc_image_data_plane_active else "webserver"
+            ),
+            "payload_mode": "delta_or_full",
             "data_protocol_version": IMAGE_SNAPSHOT_PROTOCOL_VERSION,
             "ack_protocol_version": REDUNDANCY_IMAGE_UDP_PROTOCOL_VERSION_V2,
             "sync_port": REDUNDANCY_IMAGE_SYNC_PORT,
@@ -887,6 +910,49 @@ class RuntimeManager:
         except OSError as e:
             logger.warning("Failed to persist redundancy UDP session epoch: %s", e)
         return session_id
+
+    def _try_enable_plc_redundancy_data_plane(self) -> bool:
+        """Phase 6: start UDP sync inside plc_main (webserver stays control plane)."""
+        if not self.is_redundancy:
+            return False
+        local_ip = self._redundancy_local_heartbeat_ip
+        peer_ip = (
+            self._redundancy_standby_ip
+            if self.is_master
+            else self._redundancy_master_ip
+        )
+        if not local_ip or not peer_ip:
+            return False
+        mode = "master_sender" if self.is_master else "standby_receiver"
+        cfg = json.dumps(
+            {
+                "enabled": True,
+                "data_plane_mode": mode,
+                "local_heartbeat_ip": local_ip,
+                "peer_heartbeat_ip": peer_ip,
+                "udp_port": REDUNDANCY_IMAGE_SYNC_PORT,
+                "mode": "scan_end_delta",
+            }
+        )
+        try:
+            if not self.runtime_socket.is_connected():
+                self._safe_connect_runtime_socket()
+            self.runtime_socket.send_message(f"REDUNDANCY_SYNC_CONFIG:{cfg}\n")
+            resp = self.runtime_socket.recv_message(timeout=2.0)
+            if not resp or "REDUNDANCY_SYNC_CONFIG:OK" not in resp:
+                return False
+            self.runtime_socket.send_message("REDUNDANCY_SYNC_START\n")
+            resp = self.runtime_socket.recv_message(timeout=2.0)
+            if resp and "REDUNDANCY_SYNC_START:OK" in resp:
+                self._plc_image_data_plane_active = True
+                logger.info(
+                    "[hot-redundancy] plc_main UDP data plane started (mode=%s)",
+                    mode,
+                )
+                return True
+        except (OSError, RuntimeError) as e:
+            logger.warning("[hot-redundancy] plc_main data plane start failed: %s", e)
+        return False
 
     @staticmethod
     def _format_functional_nic_names_for_log(functional_nics: list[FunctionalNicRole]) -> str:
@@ -1708,6 +1774,13 @@ class RuntimeManager:
         )
 
     def _shutdown_redundancy_heartbeat_threads(self) -> None:
+        if self._plc_image_data_plane_active:
+            try:
+                if self.runtime_socket.is_connected():
+                    self.runtime_socket.send_message("REDUNDANCY_SYNC_STOP\n")
+            except (OSError, RuntimeError):
+                pass
+            self._plc_image_data_plane_active = False
         self._heartbeat_stop.set()
         for t in list(self._heartbeat_threads):
             t.join(timeout=3)
@@ -2298,8 +2371,16 @@ class RuntimeManager:
         last_scan_counter = 0
         udp_stats = self._image_udp_master_stats
         udp_stats.current_session_id = session_id
+        if self._try_enable_plc_redundancy_data_plane():
+            logger.info(
+                "[hot-redundancy][master] webserver UDP sync disabled; plc_main data plane active"
+            )
+            while not self._heartbeat_stop.is_set() and self.is_master:
+                self._heartbeat_stop.wait(1.0)
+            return
+
         logger.info(
-            "[hot-redundancy][master] UDP I/O image sync (scan-end driven) started "
+            "[hot-redundancy][master] UDP I/O image sync (scan-end, delta preferred) "
             "(local=%s, peer=%s:%s, session=%s)",
             local_ip,
             standby_ip,
@@ -2320,17 +2401,36 @@ class RuntimeManager:
                             sock.getsockname()[1],
                         )
 
-                    payload, scan_meta, scan_err = (
-                        self.runtime_socket.image_snapshot_get_scan_end(
+                    payload = None
+                    scan_meta = None
+                    scan_err = None
+                    delta_body, delta_err = (
+                        self.runtime_socket.image_delta_get_scan_end(
                             last_scan_counter, REDUNDANCY_IMAGE_SCAN_END_WAIT_TIMEOUT_SEC
                         )
                     )
+                    if (
+                        delta_body
+                        and not delta_err
+                        and len(delta_body) <= REDUNDANCY_IMAGE_DELTA_MAX_WIRE_BYTES
+                    ):
+                        payload = delta_body
+                        scan_meta = _parse_delta_wire_metadata(delta_body)
+                    if payload is None:
+                        payload, scan_meta, scan_err = (
+                            self.runtime_socket.image_snapshot_get_scan_end(
+                                last_scan_counter,
+                                REDUNDANCY_IMAGE_SCAN_END_WAIT_TIMEOUT_SEC,
+                            )
+                        )
                     if scan_err == "scan_end_timeout":
                         udp_stats.scan_end_timeout_count += 1
+                    if not payload or scan_meta is None:
+                        self._heartbeat_stop.wait(0.05)
+                        continue
                     if (
-                        not payload
-                        or scan_meta is None
-                        or len(payload) != IMAGE_SNAPSHOT_EXPECTED_BYTES
+                        not _is_redundancy_delta_payload(payload)
+                        and len(payload) != IMAGE_SNAPSHOT_EXPECTED_BYTES
                     ):
                         self._heartbeat_stop.wait(0.05)
                         continue
@@ -2473,13 +2573,21 @@ class RuntimeManager:
             + REDUNDANCY_IMAGE_UDP_FRAGMENT_PAYLOAD_MAX
             + 64
         )
+        if self._try_enable_plc_redundancy_data_plane():
+            logger.info(
+                "[hot-redundancy][standby] webserver UDP sync disabled; plc_main data plane active"
+            )
+            while not self._heartbeat_stop.is_set():
+                self._heartbeat_stop.wait(1.0)
+            return
+
         try:
             server = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             server.bind((local_ip, REDUNDANCY_IMAGE_SYNC_PORT))
             server.settimeout(REDUNDANCY_IMAGE_UDP_FRAME_TIMEOUT_SEC / 3)
             logger.info(
-                "[hot-redundancy][standby] UDP I/O image listener %s:%s "
+                "[hot-redundancy][standby] UDP I/O image listener (barrier apply) %s:%s "
                 "(master=%s)",
                 local_ip,
                 REDUNDANCY_IMAGE_SYNC_PORT,
@@ -2586,19 +2694,18 @@ class RuntimeManager:
                         ack_status = REDUNDANCY_IMAGE_ACK_STATUS_NOT_SHADOW
                     elif not self._plc_runtime_is_running():
                         ack_status = REDUNDANCY_IMAGE_ACK_STATUS_NOT_READY
-                    else:
-                        ok, defer = self.runtime_socket.image_snapshot_set(payload)
-                        if ok:
+                    elif self.runtime_socket.image_sync_pending_set(frame_seq, payload):
+                        if self.runtime_socket.image_sync_wait_applied(frame_seq):
                             assembler.record_applied(fragment.session_id, frame_seq)
                             ack_status = REDUNDANCY_IMAGE_ACK_STATUS_OK
-                        elif defer:
-                            ack_status = REDUNDANCY_IMAGE_ACK_STATUS_NOT_READY
                         else:
-                            ack_status = REDUNDANCY_IMAGE_ACK_STATUS_APPLY_ERROR
-                            udp_stats.consecutive_apply_fail_count += 1
-                            logger.warning(
-                                "[hot-redundancy][standby] I/O image SET failed"
-                            )
+                            ack_status = REDUNDANCY_IMAGE_ACK_STATUS_NOT_READY
+                    else:
+                        ack_status = REDUNDANCY_IMAGE_ACK_STATUS_APPLY_ERROR
+                        udp_stats.consecutive_apply_fail_count += 1
+                        logger.warning(
+                            "[hot-redundancy][standby] pending queue failed"
+                        )
                 except (OSError, RuntimeError) as e:
                     ack_status = REDUNDANCY_IMAGE_ACK_STATUS_APPLY_ERROR
                     udp_stats.consecutive_apply_fail_count += 1
