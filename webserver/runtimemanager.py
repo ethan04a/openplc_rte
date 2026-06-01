@@ -7,6 +7,8 @@ import struct
 import subprocess
 import threading
 import time
+import zlib
+from dataclasses import dataclass, field
 from pathlib import Path
 
 # psutil is optional - not available on MSYS2/Cygwin platforms
@@ -55,7 +57,36 @@ RAPID_CRASH_WINDOW = 30  # seconds
 # Hot redundancy: TCP heartbeat and ports; interface names come from redundancy_role.json (with defaults)
 REDUNDANCY_HEARTBEAT_PORT = 57575
 REDUNDANCY_IMAGE_SYNC_PORT = 57576
-REDUNDANCY_IMAGE_MAGIC = b"OPIM"
+REDUNDANCY_IMAGE_UDP_DATA_MAGIC = b"OPUD"
+REDUNDANCY_IMAGE_UDP_ACK_MAGIC = b"OPAK"
+REDUNDANCY_IMAGE_UDP_DATA_FRAGMENT = 1
+REDUNDANCY_IMAGE_UDP_ACK_FRAME = 2
+REDUNDANCY_IMAGE_UDP_RESERVED = 0
+REDUNDANCY_IMAGE_UDP_FRAGMENT_PAYLOAD_MAX = 1200
+REDUNDANCY_IMAGE_UDP_ACK_TIMEOUT_SEC = 0.005
+REDUNDANCY_IMAGE_UDP_FRAME_TIMEOUT_SEC = 0.015
+REDUNDANCY_IMAGE_UDP_SESSION_EPOCH_FILE = ".redundancy_image_sync_epoch"
+REDUNDANCY_IMAGE_UDP_DATA_HEADER = struct.Struct("!4sHBBQQHHIII")
+REDUNDANCY_IMAGE_UDP_ACK_HEADER = struct.Struct("!4sHBBQQQ")
+
+REDUNDANCY_IMAGE_ACK_STATUS_OK = 0
+REDUNDANCY_IMAGE_ACK_STATUS_CRC_ERROR = 1
+REDUNDANCY_IMAGE_ACK_STATUS_BAD_HEADER = 2
+REDUNDANCY_IMAGE_ACK_STATUS_NOT_READY = 3
+REDUNDANCY_IMAGE_ACK_STATUS_NOT_SHADOW = 4
+REDUNDANCY_IMAGE_ACK_STATUS_APPLY_ERROR = 5
+REDUNDANCY_IMAGE_ACK_STATUS_OLD_SEQ = 6
+REDUNDANCY_IMAGE_ACK_STATUS_FRAME_INCOMPLETE = 7
+REDUNDANCY_IMAGE_ACK_STATUS_NAMES = {
+    REDUNDANCY_IMAGE_ACK_STATUS_OK: "OK",
+    REDUNDANCY_IMAGE_ACK_STATUS_CRC_ERROR: "CRC_ERROR",
+    REDUNDANCY_IMAGE_ACK_STATUS_BAD_HEADER: "BAD_HEADER",
+    REDUNDANCY_IMAGE_ACK_STATUS_NOT_READY: "NOT_READY",
+    REDUNDANCY_IMAGE_ACK_STATUS_NOT_SHADOW: "NOT_SHADOW",
+    REDUNDANCY_IMAGE_ACK_STATUS_APPLY_ERROR: "APPLY_ERROR",
+    REDUNDANCY_IMAGE_ACK_STATUS_OLD_SEQ: "OLD_SEQ",
+    REDUNDANCY_IMAGE_ACK_STATUS_FRAME_INCOMPLETE: "FRAME_INCOMPLETE",
+}
 # Hot redundancy: HTTP peer sync (receive-program / sync-role-ini header X-OpenPLC-Redundancy-Sync)
 REDUNDANCY_SYNC_SECRET = "openplc"
 REDUNDANCY_HB_PAYLOAD = b"OPENPLC_REDUNDANCY_HB_V1\n"
@@ -70,23 +101,509 @@ REDUNDANCY_STANDBY_LOST_THRESHOLD_SEC = 5
 PLC_STATUS_CACHE_TTL_SEC = 0.2
 
 
-def _tcp_recv_exact(conn: socket.socket, n: int, timeout: float | None) -> bytes | None:
-    """Read exactly n bytes from TCP stream."""
-    if n <= 0:
-        return b""
-    conn.settimeout(timeout)
-    chunks: list[bytes] = []
-    remaining = n
-    while remaining > 0:
+@dataclass(frozen=True)
+class RedundancyImageUdpFragment:
+    session_id: int
+    frame_seq: int
+    fragment_index: int
+    fragment_count: int
+    fragment_offset: int
+    total_len: int
+    payload_crc32: int
+    payload: bytes
+
+
+@dataclass(frozen=True)
+class RedundancyImageUdpAck:
+    status: int
+    session_id: int
+    ack_frame_seq: int
+    applied_seq: int
+
+
+@dataclass
+class RedundancyImageUdpMasterStats:
+    """UDP I/O image sync counters (master sender thread)."""
+
+    frame_send_count: int = 0
+    fragment_send_count: int = 0
+    ack_ok_count: int = 0
+    ack_timeout_count: int = 0
+    ack_error_count: int = 0
+    current_session_id: int = 0
+    last_send_frame_seq: int = 0
+    last_ack_frame_seq: int = 0
+    last_applied_seq: int = 0
+
+
+@dataclass
+class RedundancyImageUdpStandbyStats:
+    """UDP I/O image sync counters (standby receiver thread)."""
+
+    fragment_rx_count: int = 0
+    frame_complete_count: int = 0
+    frame_incomplete_count: int = 0
+    bad_source_count: int = 0
+    bad_header_count: int = 0
+    session_reset_count: int = 0
+    old_session_count: int = 0
+    old_seq_count: int = 0
+    crc_error_count: int = 0
+    not_ready_count: int = 0
+    not_shadow_count: int = 0
+    apply_error_count: int = 0
+    applied_count: int = 0
+    frame_superseded_count: int = 0
+    last_rx_frame_seq: int = 0
+    last_applied_seq: int = 0
+
+
+@dataclass
+class _RedundancyImagePendingFrame:
+    session_id: int
+    frame_seq: int
+    fragment_count: int
+    total_len: int
+    payload_crc32: int
+    first_seen: float
+    source_addr: tuple[str, int]
+    fragments: dict[int, bytes] = field(default_factory=dict)
+
+
+def _redundancy_image_crc32(payload: bytes) -> int:
+    return zlib.crc32(payload) & 0xFFFFFFFF
+
+
+def _redundancy_image_fragment_count(total_len: int) -> int:
+    if total_len <= 0:
+        raise ValueError("snapshot payload must not be empty")
+    return (total_len + REDUNDANCY_IMAGE_UDP_FRAGMENT_PAYLOAD_MAX - 1) // (
+        REDUNDANCY_IMAGE_UDP_FRAGMENT_PAYLOAD_MAX
+    )
+
+
+def _iter_redundancy_image_udp_fragments(
+    session_id: int, frame_seq: int, payload: bytes
+) -> list[bytes]:
+    if len(payload) != IMAGE_SNAPSHOT_EXPECTED_BYTES:
+        raise ValueError(
+            f"snapshot size {len(payload)} != {IMAGE_SNAPSHOT_EXPECTED_BYTES}"
+        )
+    fragment_count = _redundancy_image_fragment_count(len(payload))
+    if fragment_count > 0xFFFF:
+        raise ValueError("snapshot requires too many UDP fragments")
+    payload_crc32 = _redundancy_image_crc32(payload)
+    packets: list[bytes] = []
+    for fragment_index in range(fragment_count):
+        fragment_offset = fragment_index * REDUNDANCY_IMAGE_UDP_FRAGMENT_PAYLOAD_MAX
+        fragment_payload = payload[
+            fragment_offset : fragment_offset + REDUNDANCY_IMAGE_UDP_FRAGMENT_PAYLOAD_MAX
+        ]
+        header = REDUNDANCY_IMAGE_UDP_DATA_HEADER.pack(
+            REDUNDANCY_IMAGE_UDP_DATA_MAGIC,
+            IMAGE_SNAPSHOT_PROTOCOL_VERSION,
+            REDUNDANCY_IMAGE_UDP_DATA_FRAGMENT,
+            REDUNDANCY_IMAGE_UDP_RESERVED,
+            session_id,
+            frame_seq,
+            fragment_index,
+            fragment_count,
+            fragment_offset,
+            len(payload),
+            payload_crc32,
+        )
+        packets.append(header + fragment_payload)
+    return packets
+
+
+def _parse_redundancy_image_udp_fragment(
+    packet: bytes,
+) -> tuple[RedundancyImageUdpFragment | None, int]:
+    if len(packet) < REDUNDANCY_IMAGE_UDP_DATA_HEADER.size:
+        return None, REDUNDANCY_IMAGE_ACK_STATUS_BAD_HEADER
+    (
+        magic,
+        version,
+        packet_type,
+        reserved,
+        session_id,
+        frame_seq,
+        fragment_index,
+        fragment_count,
+        fragment_offset,
+        total_len,
+        payload_crc32,
+    ) = REDUNDANCY_IMAGE_UDP_DATA_HEADER.unpack_from(packet)
+    fragment_payload = packet[REDUNDANCY_IMAGE_UDP_DATA_HEADER.size :]
+    if (
+        magic != REDUNDANCY_IMAGE_UDP_DATA_MAGIC
+        or version != IMAGE_SNAPSHOT_PROTOCOL_VERSION
+        or packet_type != REDUNDANCY_IMAGE_UDP_DATA_FRAGMENT
+        or reserved != REDUNDANCY_IMAGE_UDP_RESERVED
+    ):
+        return None, REDUNDANCY_IMAGE_ACK_STATUS_BAD_HEADER
+    if total_len != IMAGE_SNAPSHOT_EXPECTED_BYTES or fragment_count == 0:
+        return None, REDUNDANCY_IMAGE_ACK_STATUS_BAD_HEADER
+    if fragment_index >= fragment_count:
+        return None, REDUNDANCY_IMAGE_ACK_STATUS_BAD_HEADER
+    expected_fragment_count = _redundancy_image_fragment_count(total_len)
+    if fragment_count != expected_fragment_count:
+        return None, REDUNDANCY_IMAGE_ACK_STATUS_BAD_HEADER
+    expected_offset = fragment_index * REDUNDANCY_IMAGE_UDP_FRAGMENT_PAYLOAD_MAX
+    if fragment_offset != expected_offset or fragment_offset >= total_len:
+        return None, REDUNDANCY_IMAGE_ACK_STATUS_BAD_HEADER
+    expected_len = min(
+        REDUNDANCY_IMAGE_UDP_FRAGMENT_PAYLOAD_MAX,
+        total_len - fragment_offset,
+    )
+    if len(fragment_payload) != expected_len:
+        return None, REDUNDANCY_IMAGE_ACK_STATUS_BAD_HEADER
+    return (
+        RedundancyImageUdpFragment(
+            session_id=session_id,
+            frame_seq=frame_seq,
+            fragment_index=fragment_index,
+            fragment_count=fragment_count,
+            fragment_offset=fragment_offset,
+            total_len=total_len,
+            payload_crc32=payload_crc32,
+            payload=fragment_payload,
+        ),
+        REDUNDANCY_IMAGE_ACK_STATUS_OK,
+    )
+
+
+def _redundancy_image_udp_header_ids(packet: bytes) -> tuple[int, int]:
+    if len(packet) < REDUNDANCY_IMAGE_UDP_DATA_HEADER.size:
+        return 0, 0
+    try:
+        fields = REDUNDANCY_IMAGE_UDP_DATA_HEADER.unpack_from(packet)
+    except struct.error:
+        return 0, 0
+    return int(fields[4]), int(fields[5])
+
+
+def _pack_redundancy_image_udp_ack(
+    status: int, session_id: int, ack_frame_seq: int, applied_seq: int
+) -> bytes:
+    if status not in REDUNDANCY_IMAGE_ACK_STATUS_NAMES:
+        raise ValueError(f"unknown redundancy image ACK status: {status}")
+    return REDUNDANCY_IMAGE_UDP_ACK_HEADER.pack(
+        REDUNDANCY_IMAGE_UDP_ACK_MAGIC,
+        IMAGE_SNAPSHOT_PROTOCOL_VERSION,
+        REDUNDANCY_IMAGE_UDP_ACK_FRAME,
+        status,
+        session_id,
+        ack_frame_seq,
+        applied_seq,
+    )
+
+
+def _parse_redundancy_image_udp_ack(
+    packet: bytes,
+) -> tuple[RedundancyImageUdpAck | None, int]:
+    if len(packet) != REDUNDANCY_IMAGE_UDP_ACK_HEADER.size:
+        return None, REDUNDANCY_IMAGE_ACK_STATUS_BAD_HEADER
+    (
+        magic,
+        version,
+        packet_type,
+        status,
+        session_id,
+        ack_frame_seq,
+        applied_seq,
+    ) = REDUNDANCY_IMAGE_UDP_ACK_HEADER.unpack(packet)
+    if (
+        magic != REDUNDANCY_IMAGE_UDP_ACK_MAGIC
+        or version != IMAGE_SNAPSHOT_PROTOCOL_VERSION
+        or packet_type != REDUNDANCY_IMAGE_UDP_ACK_FRAME
+        or status not in REDUNDANCY_IMAGE_ACK_STATUS_NAMES
+    ):
+        return None, REDUNDANCY_IMAGE_ACK_STATUS_BAD_HEADER
+    return (
+        RedundancyImageUdpAck(
+            status=status,
+            session_id=session_id,
+            ack_frame_seq=ack_frame_seq,
+            applied_seq=applied_seq,
+        ),
+        REDUNDANCY_IMAGE_ACK_STATUS_OK,
+    )
+
+
+class _RedundancyImageUdpFrameAssembler:
+    def __init__(
+        self,
+        timeout_sec: float = REDUNDANCY_IMAGE_UDP_FRAME_TIMEOUT_SEC,
+        stats: RedundancyImageUdpStandbyStats | None = None,
+    ):
+        self.timeout_sec = timeout_sec
+        self.stats = stats
+        self.active_session_id = 0
+        self.last_applied_seq = 0
+        self._pending: _RedundancyImagePendingFrame | None = None
+
+    def _note_rx_frame_seq(self, session_id: int, frame_seq: int) -> None:
+        if self.stats is None or session_id != self.active_session_id:
+            return
+        if frame_seq > self.stats.last_rx_frame_seq:
+            self.stats.last_rx_frame_seq = frame_seq
+
+    def expire_pending(
+        self, now: float
+    ) -> tuple[tuple[str, int], int, int, int] | None:
+        pending = self._pending
+        if pending is None or now - pending.first_seen <= self.timeout_sec:
+            return None
+        self._pending = None
+        if self.stats is not None:
+            self.stats.frame_incomplete_count += 1
+        return (
+            pending.source_addr,
+            pending.session_id,
+            pending.frame_seq,
+            REDUNDANCY_IMAGE_ACK_STATUS_FRAME_INCOMPLETE,
+        )
+
+    def add_fragment(
+        self,
+        fragment: RedundancyImageUdpFragment,
+        source_addr: tuple[str, int],
+        now: float,
+    ) -> tuple[int | None, int, bytes | None]:
+        if self.active_session_id and fragment.session_id < self.active_session_id:
+            if self.stats is not None:
+                self.stats.old_session_count += 1
+            return None, fragment.frame_seq, None
+        if fragment.session_id > self.active_session_id:
+            if self.active_session_id and self.stats is not None:
+                self.stats.session_reset_count += 1
+            self.active_session_id = fragment.session_id
+            self.last_applied_seq = 0
+            self._pending = None
+            if self.stats is not None:
+                self.stats.last_applied_seq = 0
+        if fragment.frame_seq <= self.last_applied_seq:
+            if self.stats is not None:
+                self.stats.old_seq_count += 1
+            return REDUNDANCY_IMAGE_ACK_STATUS_OLD_SEQ, fragment.frame_seq, None
+
+        pending = self._pending
+        if pending is not None:
+            if fragment.session_id != pending.session_id:
+                self._pending = None
+                pending = None
+            elif fragment.frame_seq < pending.frame_seq:
+                if self.stats is not None:
+                    self.stats.old_seq_count += 1
+                return REDUNDANCY_IMAGE_ACK_STATUS_OLD_SEQ, fragment.frame_seq, None
+            elif fragment.frame_seq > pending.frame_seq:
+                if self.stats is not None:
+                    self.stats.frame_superseded_count += 1
+                self._pending = None
+                pending = None
+
+        if pending is None:
+            pending = _RedundancyImagePendingFrame(
+                session_id=fragment.session_id,
+                frame_seq=fragment.frame_seq,
+                fragment_count=fragment.fragment_count,
+                total_len=fragment.total_len,
+                payload_crc32=fragment.payload_crc32,
+                first_seen=now,
+                source_addr=source_addr,
+            )
+            self._pending = pending
+
+        self._note_rx_frame_seq(fragment.session_id, fragment.frame_seq)
+
+        if (
+            pending.fragment_count != fragment.fragment_count
+            or pending.total_len != fragment.total_len
+            or pending.payload_crc32 != fragment.payload_crc32
+            or pending.source_addr != source_addr
+        ):
+            self._pending = None
+            if self.stats is not None:
+                self.stats.bad_header_count += 1
+            return REDUNDANCY_IMAGE_ACK_STATUS_BAD_HEADER, fragment.frame_seq, None
+
+        existing = pending.fragments.get(fragment.fragment_index)
+        if existing is not None:
+            if existing != fragment.payload:
+                self._pending = None
+                if self.stats is not None:
+                    self.stats.bad_header_count += 1
+                return REDUNDANCY_IMAGE_ACK_STATUS_BAD_HEADER, fragment.frame_seq, None
+        else:
+            pending.fragments[fragment.fragment_index] = fragment.payload
+
+        if len(pending.fragments) != pending.fragment_count:
+            return None, fragment.frame_seq, None
+
+        payload = b"".join(pending.fragments[index] for index in range(pending.fragment_count))
+        self._pending = None
+        if len(payload) != pending.total_len:
+            if self.stats is not None:
+                self.stats.bad_header_count += 1
+            return REDUNDANCY_IMAGE_ACK_STATUS_BAD_HEADER, fragment.frame_seq, None
+        if _redundancy_image_crc32(payload) != pending.payload_crc32:
+            if self.stats is not None:
+                self.stats.crc_error_count += 1
+            return REDUNDANCY_IMAGE_ACK_STATUS_CRC_ERROR, fragment.frame_seq, None
+        if self.stats is not None:
+            self.stats.frame_complete_count += 1
+        return REDUNDANCY_IMAGE_ACK_STATUS_OK, fragment.frame_seq, payload
+
+    def record_applied(self, session_id: int, frame_seq: int) -> None:
+        if session_id > self.active_session_id:
+            self.active_session_id = session_id
+            self.last_applied_seq = 0
+        if session_id == self.active_session_id and frame_seq > self.last_applied_seq:
+            self.last_applied_seq = frame_seq
+            if self.stats is not None:
+                self.stats.last_applied_seq = frame_seq
+                self.stats.applied_count += 1
+
+
+def _open_redundancy_image_master_udp_socket(local_ip: str) -> socket.socket:
+    last_error: OSError | None = None
+    for source_port in range(
+        REDUNDANCY_IMAGE_SYNC_PORT + 1, REDUNDANCY_IMAGE_SYNC_PORT + 65
+    ):
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         try:
-            chunk = conn.recv(remaining)
-        except (TimeoutError, socket.timeout, OSError):
-            return None
-        if not chunk:
-            return None
-        chunks.append(chunk)
-        remaining -= len(chunk)
-    return b"".join(chunks)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.bind((local_ip, source_port))
+            return sock
+        except OSError as e:
+            last_error = e
+            try:
+                sock.close()
+            except OSError:
+                pass
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind((local_ip, 0))
+        bound_port = sock.getsockname()[1]
+        if bound_port == REDUNDANCY_IMAGE_SYNC_PORT:
+            raise OSError(errno.EADDRINUSE, "master UDP ACK source port must not be 57576")
+        return sock
+    except OSError:
+        try:
+            sock.close()
+        except OSError:
+            pass
+        if last_error is not None:
+            raise last_error
+        raise
+
+
+def _send_redundancy_image_udp_ack(
+    sock: socket.socket,
+    addr: tuple[str, int],
+    status: int,
+    session_id: int,
+    frame_seq: int,
+    applied_seq: int,
+) -> None:
+    sock.sendto(
+        _pack_redundancy_image_udp_ack(status, session_id, frame_seq, applied_seq),
+        addr,
+    )
+
+
+def _process_redundancy_image_master_ack(
+    stats: RedundancyImageUdpMasterStats,
+    session_id: int,
+    frame_seq: int,
+    ack: RedundancyImageUdpAck,
+    peer_ip: str,
+    addr: tuple[str, int],
+) -> bool:
+    """
+    Validate a frame ACK from standby.
+
+    Returns True only when ack_frame_seq matches the frame just sent.
+    """
+    if addr[0] != peer_ip or addr[1] != REDUNDANCY_IMAGE_SYNC_PORT:
+        return False
+    if ack.session_id != session_id:
+        return False
+    if ack.ack_frame_seq > stats.last_send_frame_seq:
+        return False
+    if ack.ack_frame_seq < stats.last_ack_frame_seq:
+        return False
+    if ack.applied_seq < stats.last_applied_seq:
+        return False
+    if ack.ack_frame_seq > stats.last_ack_frame_seq:
+        stats.last_ack_frame_seq = ack.ack_frame_seq
+    if ack.applied_seq > stats.last_applied_seq:
+        stats.last_applied_seq = ack.applied_seq
+    if ack.ack_frame_seq != frame_seq:
+        return False
+    if ack.status == REDUNDANCY_IMAGE_ACK_STATUS_OK:
+        stats.ack_ok_count += 1
+    else:
+        stats.ack_error_count += 1
+    return True
+
+
+def _record_redundancy_image_standby_ack_status(
+    stats: RedundancyImageUdpStandbyStats, status: int
+) -> None:
+    if status == REDUNDANCY_IMAGE_ACK_STATUS_NOT_READY:
+        stats.not_ready_count += 1
+    elif status == REDUNDANCY_IMAGE_ACK_STATUS_NOT_SHADOW:
+        stats.not_shadow_count += 1
+    elif status == REDUNDANCY_IMAGE_ACK_STATUS_APPLY_ERROR:
+        stats.apply_error_count += 1
+
+
+REDUNDANCY_IMAGE_UDP_STATS_LOG_EVERY = 500
+
+
+def _maybe_log_redundancy_image_udp_master_stats(
+    stats: RedundancyImageUdpMasterStats,
+) -> None:
+    if stats.frame_send_count == 0 or stats.frame_send_count % REDUNDANCY_IMAGE_UDP_STATS_LOG_EVERY:
+        logger.debug(
+            "[hot-redundancy][master] UDP image sync stats "
+            "frames=%s frags=%s ack_ok=%s ack_timeout=%s ack_err=%s "
+            "session=%s last_tx=%s last_ack=%s last_applied=%s",
+            stats.frame_send_count,
+            stats.fragment_send_count,
+            stats.ack_ok_count,
+            stats.ack_timeout_count,
+            stats.ack_error_count,
+            stats.current_session_id,
+            stats.last_send_frame_seq,
+            stats.last_ack_frame_seq,
+            stats.last_applied_seq,
+        )
+
+
+def _maybe_log_redundancy_image_udp_standby_stats(
+    stats: RedundancyImageUdpStandbyStats,
+) -> None:
+    total_rx = stats.fragment_rx_count
+    if total_rx == 0 or total_rx % (REDUNDANCY_IMAGE_UDP_STATS_LOG_EVERY * 60):
+        logger.debug(
+            "[hot-redundancy][standby] UDP image sync stats "
+            "frags=%s complete=%s incomplete=%s applied=%s "
+            "old_sess=%s old_seq=%s crc_err=%s last_rx=%s last_applied=%s",
+            stats.fragment_rx_count,
+            stats.frame_complete_count,
+            stats.frame_incomplete_count,
+            stats.applied_count,
+            stats.old_session_count,
+            stats.old_seq_count,
+            stats.crc_error_count,
+            stats.last_rx_frame_seq,
+            stats.last_applied_seq,
+        )
 
 
 class RuntimeManager:
@@ -128,11 +645,33 @@ class RuntimeManager:
         self._plc_status_cache_lock = threading.Lock()
         self._plc_status_cache_monotonic: float = 0.0
         self._plc_status_cache_running: bool = False
+        self._image_udp_master_stats = RedundancyImageUdpMasterStats()
+        self._image_udp_standby_stats = RedundancyImageUdpStandbyStats()
 
     @staticmethod
     def _openplc_project_root() -> Path:
         """Repository / install root (parent of webserver/)."""
         return Path(__file__).resolve().parent.parent
+
+    def _next_redundancy_image_session_id(self) -> int:
+        epoch_path = self._openplc_project_root() / REDUNDANCY_IMAGE_UDP_SESSION_EPOCH_FILE
+        mask64 = (1 << 64) - 1
+        fallback = time.monotonic_ns() & mask64
+        if fallback == 0:
+            fallback = 1
+        try:
+            previous_text = epoch_path.read_text(encoding="ascii").strip()
+            previous = int(previous_text) if previous_text else 0
+        except (OSError, ValueError):
+            previous = 0
+        session_id = max(previous + 1, fallback)
+        if session_id > mask64:
+            session_id = fallback
+        try:
+            epoch_path.write_text(f"{session_id}\n", encoding="ascii")
+        except OSError as e:
+            logger.warning("Failed to persist redundancy UDP session epoch: %s", e)
+        return session_id
 
     @staticmethod
     def _format_functional_nic_names_for_log(functional_nics: list[FunctionalNicRole]) -> str:
@@ -1522,28 +2061,34 @@ class RuntimeManager:
             logger.info("[热冗余][备机] TCP 心跳监听线程已退出。")
 
     def _redundancy_image_sync_master_loop(self) -> None:
-        """Push I/O snapshots to standby over TCP (redundancy NIC).
-
-        Requires host plc_main RUNNING so IMAGE_SNAPSHOT_GET succeeds (same libplc as peer).
-        """
+        """Push full I/O snapshots to standby over UDP frame fragments."""
         standby_ip = self._redundancy_standby_ip
         local_ip = self._redundancy_local_heartbeat_ip
         if not standby_ip:
-            logger.warning("[热冗余][主机] 未配置备机冗余 IP，跳过 I/O 镜像同步发送")
+            logger.warning(
+                "[hot-redundancy][master] standby heartbeat IP missing; skip I/O image sync"
+            )
             return
         if not local_ip:
             logger.warning(
-                "[热冗余][主机] 冗余心跳网卡 %s 地址未就绪，跳过 I/O 镜像同步发送",
+                "[hot-redundancy][master] heartbeat NIC %s has no local IP; skip I/O image sync",
                 self._redundancy_heartbeat_nic,
             )
             return
 
         sock: socket.socket | None = None
+        dest = (standby_ip, REDUNDANCY_IMAGE_SYNC_PORT)
+        session_id = self._next_redundancy_image_session_id()
+        frame_seq = 0
+        udp_stats = self._image_udp_master_stats
+        udp_stats.current_session_id = session_id
         logger.info(
-            "[热冗余][主机] I/O 镜像同步发送线程启动（本机源地址=%s）→ %s:%s",
+            "[hot-redundancy][master] UDP I/O image sync sender started "
+            "(local=%s, peer=%s:%s, session=%s)",
             local_ip,
             standby_ip,
             REDUNDANCY_IMAGE_SYNC_PORT,
+            session_id,
         )
         try:
             while not self._heartbeat_stop.is_set():
@@ -1551,155 +2096,286 @@ class RuntimeManager:
                     break
                 try:
                     if sock is None:
-                        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                        sock.bind((local_ip, 0))
-                        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-                        sock.settimeout(5.0)
-                        sock.connect((standby_ip, REDUNDANCY_IMAGE_SYNC_PORT))
-                        sock.settimeout(30.0)
+                        sock = _open_redundancy_image_master_udp_socket(local_ip)
+                        sock.settimeout(REDUNDANCY_IMAGE_UDP_ACK_TIMEOUT_SEC)
+                        logger.info(
+                            "[hot-redundancy][master] UDP I/O image source bound to %s:%s",
+                            local_ip,
+                            sock.getsockname()[1],
+                        )
 
                     payload = self.runtime_socket.image_snapshot_get()
-                    if (
-                        not payload
-                        or len(payload) != IMAGE_SNAPSHOT_EXPECTED_BYTES
-                    ):
-                        time.sleep(0.1)
+                    if not payload or len(payload) != IMAGE_SNAPSHOT_EXPECTED_BYTES:
+                        self._heartbeat_stop.wait(0.1)
                         continue
 
-                    header = struct.pack(
-                        "!4sII",
-                        REDUNDANCY_IMAGE_MAGIC,
-                        IMAGE_SNAPSHOT_PROTOCOL_VERSION,
-                        len(payload),
+                    frame_seq = (frame_seq + 1) & ((1 << 64) - 1)
+                    if frame_seq == 0:
+                        session_id = self._next_redundancy_image_session_id()
+                        udp_stats.current_session_id = session_id
+                        frame_seq = 1
+
+                    packets = _iter_redundancy_image_udp_fragments(
+                        session_id, frame_seq, payload
                     )
-                    sock.sendall(header + payload)
-                    time.sleep(0.02)
+                    for packet in packets:
+                        sock.sendto(packet, dest)
+                    udp_stats.frame_send_count += 1
+                    udp_stats.fragment_send_count += len(packets)
+                    udp_stats.last_send_frame_seq = frame_seq
+
+                    ack_seen = False
+                    ack_deadline = time.monotonic() + REDUNDANCY_IMAGE_UDP_ACK_TIMEOUT_SEC
+                    while time.monotonic() < ack_deadline:
+                        ack_timeout = max(0.0, ack_deadline - time.monotonic())
+                        if ack_timeout <= 0:
+                            break
+                        sock.settimeout(ack_timeout)
+                        try:
+                            ack_packet, addr = sock.recvfrom(
+                                REDUNDANCY_IMAGE_UDP_ACK_HEADER.size + 64
+                            )
+                        except (TimeoutError, socket.timeout):
+                            break
+                        ack, parse_status = _parse_redundancy_image_udp_ack(ack_packet)
+                        if ack is None:
+                            logger.debug(
+                                "[hot-redundancy][master] bad UDP image ACK: %s",
+                                REDUNDANCY_IMAGE_ACK_STATUS_NAMES.get(
+                                    parse_status, parse_status
+                                ),
+                            )
+                            continue
+                        if _process_redundancy_image_master_ack(
+                            udp_stats, session_id, frame_seq, ack, standby_ip, addr
+                        ):
+                            ack_seen = True
+                            if ack.status != REDUNDANCY_IMAGE_ACK_STATUS_OK:
+                                status_name = REDUNDANCY_IMAGE_ACK_STATUS_NAMES.get(
+                                    ack.status, str(ack.status)
+                                )
+                                log = (
+                                    logger.warning
+                                    if ack.status
+                                    in (
+                                        REDUNDANCY_IMAGE_ACK_STATUS_CRC_ERROR,
+                                        REDUNDANCY_IMAGE_ACK_STATUS_BAD_HEADER,
+                                        REDUNDANCY_IMAGE_ACK_STATUS_APPLY_ERROR,
+                                    )
+                                    else logger.debug
+                                )
+                                log(
+                                    "[hot-redundancy][master] UDP image frame %s ACK=%s "
+                                    "(applied=%s)",
+                                    frame_seq,
+                                    status_name,
+                                    ack.applied_seq,
+                                )
+                            break
+                    if not ack_seen:
+                        udp_stats.ack_timeout_count += 1
+                        logger.debug(
+                            "[hot-redundancy][master] UDP image frame %s ACK timeout",
+                            frame_seq,
+                        )
+                    _maybe_log_redundancy_image_udp_master_stats(udp_stats)
+                    self._heartbeat_stop.wait(0.02)
                 except OSError as e:
-                    logger.debug("[热冗余][主机] I/O 同步 TCP 异常（将重连）: %s", e)
+                    logger.debug(
+                        "[hot-redundancy][master] UDP I/O image sync error; reconnect: %s",
+                        e,
+                    )
                     if sock is not None:
                         try:
                             sock.close()
                         except OSError:
                             pass
                         sock = None
-                    time.sleep(0.5)
+                    self._heartbeat_stop.wait(0.5)
                 except (RuntimeError, TypeError, ValueError) as e:
-                    logger.warning("[热冗余][主机] I/O 同步异常: %s", e)
-                    time.sleep(0.5)
+                    logger.warning("[hot-redundancy][master] I/O image sync error: %s", e)
+                    self._heartbeat_stop.wait(0.5)
         finally:
             if sock is not None:
                 try:
                     sock.close()
                 except OSError:
                     pass
-            logger.info("[热冗余][主机] I/O 镜像同步发送线程已退出。")
+            logger.info("[hot-redundancy][master] UDP I/O image sync sender exited")
 
     def _redundancy_image_sync_standby_loop(self) -> None:
-        """Receive I/O snapshots from master and apply via Unix socket.
-
-        Applies only when local plc_main is RUNNING (process image pointers ready).
-        """
+        """Receive UDP snapshot fragments from master and apply full frames."""
         local_ip = self._redundancy_local_heartbeat_ip
         master_ip = self._redundancy_master_ip
         if not local_ip or not master_ip:
             logger.warning(
-                "[热冗余][备机] 冗余心跳网卡 %s 地址未就绪，跳过 I/O 镜像监听",
+                "[hot-redundancy][standby] heartbeat NIC %s has no local IP; "
+                "skip I/O image listener",
                 self._redundancy_heartbeat_nic,
             )
             return
 
         server: socket.socket | None = None
+        udp_stats = self._image_udp_standby_stats
+        assembler = _RedundancyImageUdpFrameAssembler(stats=udp_stats)
+        max_datagram = (
+            REDUNDANCY_IMAGE_UDP_DATA_HEADER.size
+            + REDUNDANCY_IMAGE_UDP_FRAGMENT_PAYLOAD_MAX
+            + 64
+        )
         try:
-            server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            server = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             server.bind((local_ip, REDUNDANCY_IMAGE_SYNC_PORT))
-            server.listen(2)
+            server.settimeout(REDUNDANCY_IMAGE_UDP_FRAME_TIMEOUT_SEC / 3)
             logger.info(
-                "[热冗余][备机] I/O 镜像监听 %s:%s（仅接受主机 %s）",
+                "[hot-redundancy][standby] UDP I/O image listener %s:%s "
+                "(master=%s)",
                 local_ip,
                 REDUNDANCY_IMAGE_SYNC_PORT,
                 master_ip,
             )
-            server.settimeout(1.0)
             while not self._heartbeat_stop.is_set():
                 if self._promoted_standby_acting_master:
-                    time.sleep(0.2)
+                    self._heartbeat_stop.wait(0.2)
                     continue
+
+                expired = assembler.expire_pending(time.monotonic())
+                if expired is not None:
+                    addr, session_id, frame_seq, status = expired
+                    try:
+                        _send_redundancy_image_udp_ack(
+                            server,
+                            addr,
+                            status,
+                            session_id,
+                            frame_seq,
+                            assembler.last_applied_seq,
+                        )
+                    except OSError as e:
+                        logger.debug(
+                            "[hot-redundancy][standby] UDP image incomplete ACK failed: %s",
+                            e,
+                        )
+
                 try:
-                    conn, addr = server.accept()
-                except TimeoutError:
+                    packet, addr = server.recvfrom(max_datagram)
+                except (TimeoutError, socket.timeout):
                     continue
                 except OSError as e:
                     if self._heartbeat_stop.is_set():
                         break
-                    logger.error("[热冗余][备机] I/O 镜像 accept 失败: %s", e)
+                    logger.error(
+                        "[hot-redundancy][standby] UDP I/O image recv failed: %s",
+                        e,
+                    )
                     continue
 
                 if addr[0] != master_ip:
+                    udp_stats.bad_source_count += 1
                     logger.warning(
-                        "[热冗余][备机] I/O 镜像拒绝非主机连接 %s",
+                        "[hot-redundancy][standby] reject UDP I/O image packet from %s:%s",
                         addr[0],
+                        addr[1],
                     )
-                    try:
-                        conn.close()
-                    except OSError:
-                        pass
                     continue
 
-                conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-                try:
-                    while (
-                        not self._heartbeat_stop.is_set()
-                        and not self._promoted_standby_acting_master
-                    ):
-                        hdr = _tcp_recv_exact(conn, 12, 30.0)
-                        if hdr is None or len(hdr) != 12:
-                            break
-                        magic, ver, ln = struct.unpack("!4sII", hdr)
-                        if magic != REDUNDANCY_IMAGE_MAGIC:
-                            break
-                        if ver != IMAGE_SNAPSHOT_PROTOCOL_VERSION:
-                            break
-                        if ln != IMAGE_SNAPSHOT_EXPECTED_BYTES:
-                            break
-                        body = _tcp_recv_exact(conn, ln, 30.0)
-                        if body is None or len(body) != ln:
-                            break
+                fragment, parse_status = _parse_redundancy_image_udp_fragment(packet)
+                if fragment is None:
+                    udp_stats.bad_header_count += 1
+                    session_id, frame_seq = _redundancy_image_udp_header_ids(packet)
+                    if session_id and frame_seq:
                         try:
-                            if not self.runtime_socket.is_connected():
-                                self._safe_connect_runtime_socket()
-                            if not self._plc_shadow_standby:
-                                time.sleep(0.15)
-                                continue
-                            if not self._plc_runtime_is_running():
-                                time.sleep(0.15)
-                                continue
-                            ok, defer = self.runtime_socket.image_snapshot_set(body)
-                            if ok:
-                                continue
-                            if defer:
-                                time.sleep(0.15)
-                                continue
-                            logger.warning(
-                                "[热冗余][备机] I/O 镜像 SET 失败，关闭 TCP 连接"
+                            _send_redundancy_image_udp_ack(
+                                server,
+                                addr,
+                                parse_status,
+                                session_id,
+                                frame_seq,
+                                assembler.last_applied_seq,
                             )
-                            break
-                        except (OSError, RuntimeError) as e:
-                            logger.warning("[热冗余][备机] I/O 镜像 SET 失败: %s", e)
-                            break
-                finally:
+                        except OSError as e:
+                            logger.debug(
+                                "[hot-redundancy][standby] bad-header ACK failed: %s",
+                                e,
+                            )
+                    continue
+
+                udp_stats.fragment_rx_count += 1
+                status, frame_seq, payload = assembler.add_fragment(
+                    fragment, addr, time.monotonic()
+                )
+                if status is None:
+                    _maybe_log_redundancy_image_udp_standby_stats(udp_stats)
+                    continue
+                if payload is None:
+                    _record_redundancy_image_standby_ack_status(udp_stats, status)
                     try:
-                        conn.close()
-                    except OSError:
-                        pass
+                        _send_redundancy_image_udp_ack(
+                            server,
+                            addr,
+                            status,
+                            fragment.session_id,
+                            frame_seq,
+                            assembler.last_applied_seq,
+                        )
+                    except OSError as e:
+                        logger.debug(
+                            "[hot-redundancy][standby] UDP image status ACK failed: %s",
+                            e,
+                        )
+                    _maybe_log_redundancy_image_udp_standby_stats(udp_stats)
+                    continue
+
+                ack_status = REDUNDANCY_IMAGE_ACK_STATUS_APPLY_ERROR
+                try:
+                    if not self.runtime_socket.is_connected():
+                        self._safe_connect_runtime_socket()
+                    if not self._plc_shadow_standby:
+                        ack_status = REDUNDANCY_IMAGE_ACK_STATUS_NOT_SHADOW
+                    elif not self._plc_runtime_is_running():
+                        ack_status = REDUNDANCY_IMAGE_ACK_STATUS_NOT_READY
+                    else:
+                        ok, defer = self.runtime_socket.image_snapshot_set(payload)
+                        if ok:
+                            assembler.record_applied(fragment.session_id, frame_seq)
+                            ack_status = REDUNDANCY_IMAGE_ACK_STATUS_OK
+                        elif defer:
+                            ack_status = REDUNDANCY_IMAGE_ACK_STATUS_NOT_READY
+                        else:
+                            ack_status = REDUNDANCY_IMAGE_ACK_STATUS_APPLY_ERROR
+                            logger.warning(
+                                "[hot-redundancy][standby] I/O image SET failed"
+                            )
+                except (OSError, RuntimeError) as e:
+                    ack_status = REDUNDANCY_IMAGE_ACK_STATUS_APPLY_ERROR
+                    logger.warning(
+                        "[hot-redundancy][standby] I/O image SET failed: %s", e
+                    )
+
+                _record_redundancy_image_standby_ack_status(udp_stats, ack_status)
+                try:
+                    _send_redundancy_image_udp_ack(
+                        server,
+                        addr,
+                        ack_status,
+                        fragment.session_id,
+                        frame_seq,
+                        assembler.last_applied_seq,
+                    )
+                except OSError as e:
+                    logger.debug(
+                        "[hot-redundancy][standby] UDP image apply ACK failed: %s",
+                        e,
+                    )
+                _maybe_log_redundancy_image_udp_standby_stats(udp_stats)
         finally:
             if server is not None:
                 try:
                     server.close()
                 except OSError:
                     pass
-            logger.info("[热冗余][备机] I/O 镜像监听线程已退出。")
+            logger.info("[hot-redundancy][standby] UDP I/O image listener exited")
 
     def _start_redundancy_heartbeat_threads(self) -> None:
         self._shutdown_redundancy_heartbeat_threads()
@@ -1707,6 +2383,10 @@ class RuntimeManager:
         self._heartbeat_stop = threading.Event()
         if not self.is_redundancy:
             return
+        if self.is_master:
+            self._image_udp_master_stats = RedundancyImageUdpMasterStats()
+        else:
+            self._image_udp_standby_stats = RedundancyImageUdpStandbyStats()
         if self.is_master:
             t = threading.Thread(
                 target=self._redundancy_master_tcp_heartbeat_loop,
