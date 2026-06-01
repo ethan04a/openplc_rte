@@ -850,7 +850,7 @@ class RuntimeManager:
                 self._safe_connect_runtime_socket()
             self.runtime_socket.send_message("REDUNDANCY_SYNC_STATUS\n")
             resp = self.runtime_socket.recv_message(timeout=1.0)
-        except (OSError, RuntimeError, json.JSONDecodeError) as e:
+        except (OSError, RuntimeError) as e:
             logger.debug("[hot-redundancy] REDUNDANCY_SYNC_STATUS failed: %s", e)
             return {}
         if not resp or "REDUNDANCY_SYNC_STATUS:" not in resp:
@@ -860,7 +860,10 @@ class RuntimeManager:
         body = resp[idx + len(prefix) :].strip()
         if not body.startswith("{"):
             return {}
-        return json.loads(body)
+        try:
+            return json.loads(body)
+        except json.JSONDecodeError:
+            return {}
 
     def get_redundancy_image_sync_status(self) -> dict[str, Any]:
         """
