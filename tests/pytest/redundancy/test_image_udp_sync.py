@@ -2,24 +2,33 @@
 
 from __future__ import annotations
 
+from webserver.unixclient import IMAGE_SNAPSHOT_PROTOCOL_VERSION
+
 from webserver.runtimemanager import (
     IMAGE_SNAPSHOT_EXPECTED_BYTES,
-    RedundancyImageUdpFragment,
+    REDUNDANCY_IMAGE_UDP_ACK_HEADER,
     REDUNDANCY_IMAGE_ACK_STATUS_BAD_HEADER,
     REDUNDANCY_IMAGE_ACK_STATUS_CRC_ERROR,
     REDUNDANCY_IMAGE_ACK_STATUS_FRAME_INCOMPLETE,
     REDUNDANCY_IMAGE_ACK_STATUS_OK,
     REDUNDANCY_IMAGE_ACK_STATUS_OLD_SEQ,
     REDUNDANCY_IMAGE_SYNC_PORT,
+    REDUNDANCY_IMAGE_UDP_ACK_HEADER_V2,
     REDUNDANCY_IMAGE_UDP_FRAGMENT_PAYLOAD_MAX,
     REDUNDANCY_IMAGE_UDP_FRAME_TIMEOUT_SEC,
+    REDUNDANCY_IMAGE_UDP_PROTOCOL_VERSION_V2,
+    RedundancyImageFrameMetadata,
     RedundancyImageUdpAck,
+    RedundancyImageUdpFragment,
     RedundancyImageUdpMasterStats,
     RedundancyImageUdpStandbyStats,
     _RedundancyImageUdpFrameAssembler,
     _iter_redundancy_image_udp_fragments,
+    _pack_redundancy_image_udp_ack,
+    _parse_redundancy_image_udp_ack,
     _parse_redundancy_image_udp_fragment,
     _process_redundancy_image_master_ack,
+    _record_redundancy_image_master_ack_latency,
     _redundancy_image_crc32,
     _redundancy_image_fragment_count,
 )
@@ -208,6 +217,62 @@ def test_master_ack_ignores_stale_frame_seq():
         stats, 1, 10, ack, "192.168.200.20", ("192.168.200.20", REDUNDANCY_IMAGE_SYNC_PORT)
     )
     assert stats.ack_ok_count == 0
+
+
+def test_udp_ack_v1_still_parsed():
+    packet = REDUNDANCY_IMAGE_UDP_ACK_HEADER.pack(
+        b"OPAK",
+        IMAGE_SNAPSHOT_PROTOCOL_VERSION,
+        2,
+        REDUNDANCY_IMAGE_ACK_STATUS_OK,
+        1,
+        5,
+        5,
+    )
+    ack, status = _parse_redundancy_image_udp_ack(packet)
+    assert status == REDUNDANCY_IMAGE_ACK_STATUS_OK
+    assert ack is not None
+    assert ack.protocol_version == IMAGE_SNAPSHOT_PROTOCOL_VERSION
+    assert ack.timestamp_ns == 0
+
+
+def test_udp_ack_v2_roundtrip():
+    packet = _pack_redundancy_image_udp_ack(
+        REDUNDANCY_IMAGE_ACK_STATUS_OK, 99, 12, 12, timestamp_ns=123456789
+    )
+    assert len(packet) == REDUNDANCY_IMAGE_UDP_ACK_HEADER_V2.size
+    ack, status = _parse_redundancy_image_udp_ack(packet)
+    assert status == REDUNDANCY_IMAGE_ACK_STATUS_OK
+    assert ack is not None
+    assert ack.protocol_version == REDUNDANCY_IMAGE_UDP_PROTOCOL_VERSION_V2
+    assert ack.timestamp_ns == 123456789
+    assert ack.ack_frame_seq == 12
+
+
+def test_frame_metadata_placeholder():
+    meta = RedundancyImageFrameMetadata.placeholder_now()
+    assert meta.scan_counter == 0
+    assert meta.tick == 0
+    assert meta.timestamp_ns > 0
+
+
+def test_master_ack_latency_recording():
+    stats = RedundancyImageUdpMasterStats()
+    stats.last_send_frame_seq = 3
+    ack = RedundancyImageUdpAck(
+        status=REDUNDANCY_IMAGE_ACK_STATUS_OK,
+        session_id=1,
+        ack_frame_seq=3,
+        applied_seq=3,
+        protocol_version=REDUNDANCY_IMAGE_UDP_PROTOCOL_VERSION_V2,
+    )
+    send_mono = 1000.0
+    assert _process_redundancy_image_master_ack(
+        stats, 1, 3, ack, "192.168.200.20", ("192.168.200.20", REDUNDANCY_IMAGE_SYNC_PORT)
+    )
+    _record_redundancy_image_master_ack_latency(stats, send_mono, ack)
+    assert stats.last_ack_latency_ms >= 0.0
+    assert stats.last_ack_status_name == "OK"
 
 
 def test_master_ack_rejects_wrong_source_port():

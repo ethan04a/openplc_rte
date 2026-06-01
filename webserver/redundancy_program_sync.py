@@ -11,6 +11,7 @@ import time
 from pathlib import Path
 
 from flask import jsonify, request
+from flask_jwt_extended import jwt_required
 
 from webserver.logger import get_logger
 from webserver.plcapp_management import (
@@ -113,6 +114,12 @@ def register_redundancy_sync_routes(runtime_manager: RuntimeManager) -> None:
             len(cidrs),
         )
         return jsonify({"ok": True}), 200
+
+    @restapi_bp.route("/redundancy/image-sync-status", methods=["GET"])
+    @jwt_required()
+    def redundancy_image_sync_status():
+        """Phase 2: UDP I/O image sync observability (REDUNDANCY_SYNC_STATUS)."""
+        return jsonify(runtime_manager.get_redundancy_image_sync_status()), 200
 
 
 def _wait_for_running(runtime_manager: RuntimeManager, timeout_sec: float = 15.0) -> bool:

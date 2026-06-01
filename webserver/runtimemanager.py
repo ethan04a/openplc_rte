@@ -8,8 +8,9 @@ import subprocess
 import threading
 import time
 import zlib
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
+from typing import Any
 
 # psutil is optional - not available on MSYS2/Cygwin platforms
 try:
@@ -67,7 +68,13 @@ REDUNDANCY_IMAGE_UDP_ACK_TIMEOUT_SEC = 0.005
 REDUNDANCY_IMAGE_UDP_FRAME_TIMEOUT_SEC = 0.015
 REDUNDANCY_IMAGE_UDP_SESSION_EPOCH_FILE = ".redundancy_image_sync_epoch"
 REDUNDANCY_IMAGE_UDP_DATA_HEADER = struct.Struct("!4sHBBQQHHIII")
+# Phase 1 ACK (version=1); still accepted on the master for backward compatibility.
 REDUNDANCY_IMAGE_UDP_ACK_HEADER = struct.Struct("!4sHBBQQQ")
+# Phase 2 ACK (version=2): adds timestamp_ns for RTT / observability (DATA fragments stay v1).
+REDUNDANCY_IMAGE_UDP_PROTOCOL_VERSION_V2 = 2
+REDUNDANCY_IMAGE_UDP_ACK_HEADER_V2 = struct.Struct("!4sHBBQQQQ")
+REDUNDANCY_IMAGE_PHASE_SNAPSHOT_ASYNC = 0
+REDUNDANCY_IMAGE_UDP_ACK_LATENCY_EMA_ALPHA = 0.2
 
 REDUNDANCY_IMAGE_ACK_STATUS_OK = 0
 REDUNDANCY_IMAGE_ACK_STATUS_CRC_ERROR = 1
@@ -119,6 +126,26 @@ class RedundancyImageUdpAck:
     session_id: int
     ack_frame_seq: int
     applied_seq: int
+    timestamp_ns: int = 0
+    protocol_version: int = 1
+
+
+@dataclass(frozen=True)
+class RedundancyImageFrameMetadata:
+    """
+    Per-frame sync metadata (phase 2).
+
+    scan_counter / tick / phase are placeholders until scan-cycle binding (phase 3+).
+    """
+
+    scan_counter: int = 0
+    tick: int = 0
+    phase: int = REDUNDANCY_IMAGE_PHASE_SNAPSHOT_ASYNC
+    timestamp_ns: int = 0
+
+    @classmethod
+    def placeholder_now(cls) -> RedundancyImageFrameMetadata:
+        return cls(timestamp_ns=time.time_ns())
 
 
 @dataclass
@@ -134,6 +161,18 @@ class RedundancyImageUdpMasterStats:
     last_send_frame_seq: int = 0
     last_ack_frame_seq: int = 0
     last_applied_seq: int = 0
+    last_send_monotonic: float = 0.0
+    last_ack_monotonic: float = 0.0
+    last_ack_latency_ms: float = 0.0
+    ack_latency_ema_ms: float = 0.0
+    consecutive_ack_miss_count: int = 0
+    last_ack_status: int = -1
+    last_ack_status_name: str = ""
+    last_send_timestamp_ns: int = 0
+    last_scan_counter: int = 0
+    last_tick: int = 0
+    last_phase: int = REDUNDANCY_IMAGE_PHASE_SNAPSHOT_ASYNC
+    payload_crc32: int = 0
 
 
 @dataclass
@@ -156,6 +195,14 @@ class RedundancyImageUdpStandbyStats:
     frame_superseded_count: int = 0
     last_rx_frame_seq: int = 0
     last_applied_seq: int = 0
+    last_frame_complete_monotonic: float = 0.0
+    last_successful_apply_monotonic: float = 0.0
+    last_ack_sent_monotonic: float = 0.0
+    last_error_status: int = -1
+    last_error_status_name: str = ""
+    last_rx_timestamp_ns: int = 0
+    consecutive_apply_fail_count: int = 0
+    active_session_id: int = 0
 
 
 @dataclass
@@ -284,50 +331,107 @@ def _redundancy_image_udp_header_ids(packet: bytes) -> tuple[int, int]:
 
 
 def _pack_redundancy_image_udp_ack(
-    status: int, session_id: int, ack_frame_seq: int, applied_seq: int
+    status: int,
+    session_id: int,
+    ack_frame_seq: int,
+    applied_seq: int,
+    timestamp_ns: int | None = None,
 ) -> bytes:
     if status not in REDUNDANCY_IMAGE_ACK_STATUS_NAMES:
         raise ValueError(f"unknown redundancy image ACK status: {status}")
-    return REDUNDANCY_IMAGE_UDP_ACK_HEADER.pack(
+    if timestamp_ns is None:
+        timestamp_ns = time.time_ns()
+    return REDUNDANCY_IMAGE_UDP_ACK_HEADER_V2.pack(
         REDUNDANCY_IMAGE_UDP_ACK_MAGIC,
-        IMAGE_SNAPSHOT_PROTOCOL_VERSION,
+        REDUNDANCY_IMAGE_UDP_PROTOCOL_VERSION_V2,
         REDUNDANCY_IMAGE_UDP_ACK_FRAME,
         status,
         session_id,
         ack_frame_seq,
         applied_seq,
+        timestamp_ns,
     )
 
 
 def _parse_redundancy_image_udp_ack(
     packet: bytes,
 ) -> tuple[RedundancyImageUdpAck | None, int]:
-    if len(packet) != REDUNDANCY_IMAGE_UDP_ACK_HEADER.size:
-        return None, REDUNDANCY_IMAGE_ACK_STATUS_BAD_HEADER
-    (
-        magic,
-        version,
-        packet_type,
-        status,
-        session_id,
-        ack_frame_seq,
-        applied_seq,
-    ) = REDUNDANCY_IMAGE_UDP_ACK_HEADER.unpack(packet)
-    if (
-        magic != REDUNDANCY_IMAGE_UDP_ACK_MAGIC
-        or version != IMAGE_SNAPSHOT_PROTOCOL_VERSION
-        or packet_type != REDUNDANCY_IMAGE_UDP_ACK_FRAME
-        or status not in REDUNDANCY_IMAGE_ACK_STATUS_NAMES
-    ):
-        return None, REDUNDANCY_IMAGE_ACK_STATUS_BAD_HEADER
-    return (
-        RedundancyImageUdpAck(
-            status=status,
-            session_id=session_id,
-            ack_frame_seq=ack_frame_seq,
-            applied_seq=applied_seq,
-        ),
-        REDUNDANCY_IMAGE_ACK_STATUS_OK,
+    if len(packet) >= REDUNDANCY_IMAGE_UDP_ACK_HEADER_V2.size:
+        (
+            magic,
+            version,
+            packet_type,
+            status,
+            session_id,
+            ack_frame_seq,
+            applied_seq,
+            timestamp_ns,
+        ) = REDUNDANCY_IMAGE_UDP_ACK_HEADER_V2.unpack_from(packet)
+        if (
+            magic == REDUNDANCY_IMAGE_UDP_ACK_MAGIC
+            and version == REDUNDANCY_IMAGE_UDP_PROTOCOL_VERSION_V2
+            and packet_type == REDUNDANCY_IMAGE_UDP_ACK_FRAME
+            and status in REDUNDANCY_IMAGE_ACK_STATUS_NAMES
+        ):
+            return (
+                RedundancyImageUdpAck(
+                    status=status,
+                    session_id=session_id,
+                    ack_frame_seq=ack_frame_seq,
+                    applied_seq=applied_seq,
+                    timestamp_ns=timestamp_ns,
+                    protocol_version=REDUNDANCY_IMAGE_UDP_PROTOCOL_VERSION_V2,
+                ),
+                REDUNDANCY_IMAGE_ACK_STATUS_OK,
+            )
+    if len(packet) == REDUNDANCY_IMAGE_UDP_ACK_HEADER.size:
+        (
+            magic,
+            version,
+            packet_type,
+            status,
+            session_id,
+            ack_frame_seq,
+            applied_seq,
+        ) = REDUNDANCY_IMAGE_UDP_ACK_HEADER.unpack(packet)
+        if (
+            magic == REDUNDANCY_IMAGE_UDP_ACK_MAGIC
+            and version == IMAGE_SNAPSHOT_PROTOCOL_VERSION
+            and packet_type == REDUNDANCY_IMAGE_UDP_ACK_FRAME
+            and status in REDUNDANCY_IMAGE_ACK_STATUS_NAMES
+        ):
+            return (
+                RedundancyImageUdpAck(
+                    status=status,
+                    session_id=session_id,
+                    ack_frame_seq=ack_frame_seq,
+                    applied_seq=applied_seq,
+                    protocol_version=IMAGE_SNAPSHOT_PROTOCOL_VERSION,
+                ),
+                REDUNDANCY_IMAGE_ACK_STATUS_OK,
+            )
+    return None, REDUNDANCY_IMAGE_ACK_STATUS_BAD_HEADER
+
+
+def _record_redundancy_image_master_ack_latency(
+    stats: RedundancyImageUdpMasterStats,
+    send_monotonic: float,
+    ack: RedundancyImageUdpAck,
+) -> None:
+    now = time.monotonic()
+    latency_ms = max(0.0, (now - send_monotonic) * 1000.0)
+    stats.last_ack_monotonic = now
+    stats.last_ack_latency_ms = latency_ms
+    if stats.ack_latency_ema_ms <= 0.0:
+        stats.ack_latency_ema_ms = latency_ms
+    else:
+        alpha = REDUNDANCY_IMAGE_UDP_ACK_LATENCY_EMA_ALPHA
+        stats.ack_latency_ema_ms = (
+            alpha * latency_ms + (1.0 - alpha) * stats.ack_latency_ema_ms
+        )
+    stats.last_ack_status = ack.status
+    stats.last_ack_status_name = REDUNDANCY_IMAGE_ACK_STATUS_NAMES.get(
+        ack.status, str(ack.status)
     )
 
 
@@ -383,6 +487,7 @@ class _RedundancyImageUdpFrameAssembler:
             self._pending = None
             if self.stats is not None:
                 self.stats.last_applied_seq = 0
+                self.stats.active_session_id = fragment.session_id
         if fragment.frame_seq <= self.last_applied_seq:
             if self.stats is not None:
                 self.stats.old_seq_count += 1
@@ -414,6 +519,8 @@ class _RedundancyImageUdpFrameAssembler:
                 source_addr=source_addr,
             )
             self._pending = pending
+            if self.stats is not None:
+                self.stats.last_rx_timestamp_ns = time.time_ns()
 
         self._note_rx_frame_seq(fragment.session_id, fragment.frame_seq)
 
@@ -453,17 +560,22 @@ class _RedundancyImageUdpFrameAssembler:
             return REDUNDANCY_IMAGE_ACK_STATUS_CRC_ERROR, fragment.frame_seq, None
         if self.stats is not None:
             self.stats.frame_complete_count += 1
+            self.stats.last_frame_complete_monotonic = time.monotonic()
         return REDUNDANCY_IMAGE_ACK_STATUS_OK, fragment.frame_seq, payload
 
     def record_applied(self, session_id: int, frame_seq: int) -> None:
         if session_id > self.active_session_id:
             self.active_session_id = session_id
             self.last_applied_seq = 0
+            if self.stats is not None:
+                self.stats.active_session_id = session_id
         if session_id == self.active_session_id and frame_seq > self.last_applied_seq:
             self.last_applied_seq = frame_seq
             if self.stats is not None:
                 self.stats.last_applied_seq = frame_seq
                 self.stats.applied_count += 1
+                self.stats.last_successful_apply_monotonic = time.monotonic()
+                self.stats.consecutive_apply_fail_count = 0
 
 
 def _open_redundancy_image_master_udp_socket(local_ip: str) -> socket.socket:
@@ -551,9 +663,61 @@ def _process_redundancy_image_master_ack(
     return True
 
 
+def _redundancy_image_master_stats_to_dict(
+    stats: RedundancyImageUdpMasterStats,
+) -> dict[str, Any]:
+    data = asdict(stats)
+    data["role"] = "master"
+    data["phase_name"] = "SNAPSHOT_ASYNC"
+    return data
+
+
+def _redundancy_image_sync_metadata_view(
+    stats_payload: dict[str, Any], role: str
+) -> dict[str, Any]:
+    if role == "master":
+        timestamp_ns = int(stats_payload.get("last_send_timestamp_ns", 0))
+    elif role == "standby":
+        timestamp_ns = int(stats_payload.get("last_rx_timestamp_ns", 0))
+    else:
+        timestamp_ns = 0
+    return {
+        "scan_counter": int(stats_payload.get("last_scan_counter", 0)),
+        "tick": int(stats_payload.get("last_tick", 0)),
+        "phase": int(
+            stats_payload.get("last_phase", REDUNDANCY_IMAGE_PHASE_SNAPSHOT_ASYNC)
+        ),
+        "phase_name": "SNAPSHOT_ASYNC",
+        "timestamp_ns": timestamp_ns,
+        "note": "scan_counter/tick/phase are placeholders until phase 3",
+    }
+
+
+def _redundancy_image_standby_stats_to_dict(
+    stats: RedundancyImageUdpStandbyStats,
+) -> dict[str, Any]:
+    data = asdict(stats)
+    data["role"] = "standby"
+    if stats.last_error_status >= 0:
+        data["last_error_status_name"] = REDUNDANCY_IMAGE_ACK_STATUS_NAMES.get(
+            stats.last_error_status, str(stats.last_error_status)
+        )
+    else:
+        data["last_error_status_name"] = ""
+    return data
+
+
 def _record_redundancy_image_standby_ack_status(
     stats: RedundancyImageUdpStandbyStats, status: int
 ) -> None:
+    if status not in (
+        REDUNDANCY_IMAGE_ACK_STATUS_OK,
+        REDUNDANCY_IMAGE_ACK_STATUS_OLD_SEQ,
+    ):
+        stats.last_error_status = status
+        stats.last_error_status_name = REDUNDANCY_IMAGE_ACK_STATUS_NAMES.get(
+            status, str(status)
+        )
     if status == REDUNDANCY_IMAGE_ACK_STATUS_NOT_READY:
         stats.not_ready_count += 1
     elif status == REDUNDANCY_IMAGE_ACK_STATUS_NOT_SHADOW:
@@ -582,6 +746,10 @@ def _maybe_log_redundancy_image_udp_master_stats(
             stats.last_send_frame_seq,
             stats.last_ack_frame_seq,
             stats.last_applied_seq,
+            stats.last_ack_latency_ms,
+            stats.ack_latency_ema_ms,
+            stats.consecutive_ack_miss_count,
+            stats.last_ack_status_name,
         )
 
 
@@ -603,6 +771,9 @@ def _maybe_log_redundancy_image_udp_standby_stats(
             stats.crc_error_count,
             stats.last_rx_frame_seq,
             stats.last_applied_seq,
+            stats.last_successful_apply_monotonic,
+            stats.last_error_status_name,
+            stats.consecutive_apply_fail_count,
         )
 
 
@@ -647,6 +818,45 @@ class RuntimeManager:
         self._plc_status_cache_running: bool = False
         self._image_udp_master_stats = RedundancyImageUdpMasterStats()
         self._image_udp_standby_stats = RedundancyImageUdpStandbyStats()
+        self._image_udp_stats_lock = threading.Lock()
+
+    def get_redundancy_image_sync_status(self) -> dict[str, Any]:
+        """
+        Phase 2 observability: UDP I/O image sync counters and latency (REDUNDANCY_SYNC_STATUS).
+        """
+        with self._image_udp_stats_lock:
+            if self.is_redundancy and self.is_master:
+                stats_payload: dict[str, Any] = _redundancy_image_master_stats_to_dict(
+                    self._image_udp_master_stats
+                )
+                role = "master"
+            elif self.is_redundancy:
+                stats_payload = _redundancy_image_standby_stats_to_dict(
+                    self._image_udp_standby_stats
+                )
+                role = "standby"
+            else:
+                stats_payload = {}
+                role = "none"
+        return {
+            "enabled": self.is_redundancy,
+            "role": role,
+            "transport": "udp_fragment",
+            "data_protocol_version": IMAGE_SNAPSHOT_PROTOCOL_VERSION,
+            "ack_protocol_version": REDUNDANCY_IMAGE_UDP_PROTOCOL_VERSION_V2,
+            "sync_port": REDUNDANCY_IMAGE_SYNC_PORT,
+            "local_heartbeat_ip": self._redundancy_local_heartbeat_ip,
+            "peer_heartbeat_ip": (
+                self._redundancy_standby_ip
+                if self.is_master
+                else self._redundancy_master_ip
+            ),
+            "shadow_standby": self._plc_shadow_standby,
+            "plc_running": self._plc_runtime_is_running(),
+            "metadata": _redundancy_image_sync_metadata_view(stats_payload, role),
+            "stats": stats_payload,
+            "updated_monotonic": time.monotonic(),
+        }
 
     @staticmethod
     def _openplc_project_root() -> Path:
@@ -2115,26 +2325,37 @@ class RuntimeManager:
                         udp_stats.current_session_id = session_id
                         frame_seq = 1
 
+                    frame_meta = RedundancyImageFrameMetadata.placeholder_now()
+                    udp_stats.last_send_timestamp_ns = frame_meta.timestamp_ns
+                    udp_stats.last_scan_counter = frame_meta.scan_counter
+                    udp_stats.last_tick = frame_meta.tick
+                    udp_stats.last_phase = frame_meta.phase
+                    udp_stats.payload_crc32 = _redundancy_image_crc32(payload)
+
                     packets = _iter_redundancy_image_udp_fragments(
                         session_id, frame_seq, payload
                     )
                     for packet in packets:
                         sock.sendto(packet, dest)
+                    send_done_monotonic = time.monotonic()
+                    udp_stats.last_send_monotonic = send_done_monotonic
                     udp_stats.frame_send_count += 1
                     udp_stats.fragment_send_count += len(packets)
                     udp_stats.last_send_frame_seq = frame_seq
 
                     ack_seen = False
-                    ack_deadline = time.monotonic() + REDUNDANCY_IMAGE_UDP_ACK_TIMEOUT_SEC
+                    ack_deadline = send_done_monotonic + REDUNDANCY_IMAGE_UDP_ACK_TIMEOUT_SEC
+                    max_ack_datagram = max(
+                        REDUNDANCY_IMAGE_UDP_ACK_HEADER.size,
+                        REDUNDANCY_IMAGE_UDP_ACK_HEADER_V2.size,
+                    ) + 64
                     while time.monotonic() < ack_deadline:
                         ack_timeout = max(0.0, ack_deadline - time.monotonic())
                         if ack_timeout <= 0:
                             break
                         sock.settimeout(ack_timeout)
                         try:
-                            ack_packet, addr = sock.recvfrom(
-                                REDUNDANCY_IMAGE_UDP_ACK_HEADER.size + 64
-                            )
+                            ack_packet, addr = sock.recvfrom(max_ack_datagram)
                         except (TimeoutError, socket.timeout):
                             break
                         ack, parse_status = _parse_redundancy_image_udp_ack(ack_packet)
@@ -2150,6 +2371,10 @@ class RuntimeManager:
                             udp_stats, session_id, frame_seq, ack, standby_ip, addr
                         ):
                             ack_seen = True
+                            _record_redundancy_image_master_ack_latency(
+                                udp_stats, send_done_monotonic, ack
+                            )
+                            udp_stats.consecutive_ack_miss_count = 0
                             if ack.status != REDUNDANCY_IMAGE_ACK_STATUS_OK:
                                 status_name = REDUNDANCY_IMAGE_ACK_STATUS_NAMES.get(
                                     ack.status, str(ack.status)
@@ -2174,9 +2399,12 @@ class RuntimeManager:
                             break
                     if not ack_seen:
                         udp_stats.ack_timeout_count += 1
+                        udp_stats.consecutive_ack_miss_count += 1
                         logger.debug(
-                            "[hot-redundancy][master] UDP image frame %s ACK timeout",
+                            "[hot-redundancy][master] UDP image frame %s ACK timeout "
+                            "(consecutive_miss=%s)",
                             frame_seq,
+                            udp_stats.consecutive_ack_miss_count,
                         )
                     _maybe_log_redundancy_image_udp_master_stats(udp_stats)
                     self._heartbeat_stop.wait(0.02)
@@ -2319,6 +2547,7 @@ class RuntimeManager:
                             frame_seq,
                             assembler.last_applied_seq,
                         )
+                        udp_stats.last_ack_sent_monotonic = time.monotonic()
                     except OSError as e:
                         logger.debug(
                             "[hot-redundancy][standby] UDP image status ACK failed: %s",
@@ -2344,11 +2573,13 @@ class RuntimeManager:
                             ack_status = REDUNDANCY_IMAGE_ACK_STATUS_NOT_READY
                         else:
                             ack_status = REDUNDANCY_IMAGE_ACK_STATUS_APPLY_ERROR
+                            udp_stats.consecutive_apply_fail_count += 1
                             logger.warning(
                                 "[hot-redundancy][standby] I/O image SET failed"
                             )
                 except (OSError, RuntimeError) as e:
                     ack_status = REDUNDANCY_IMAGE_ACK_STATUS_APPLY_ERROR
+                    udp_stats.consecutive_apply_fail_count += 1
                     logger.warning(
                         "[hot-redundancy][standby] I/O image SET failed: %s", e
                     )
@@ -2363,6 +2594,7 @@ class RuntimeManager:
                         frame_seq,
                         assembler.last_applied_seq,
                     )
+                    udp_stats.last_ack_sent_monotonic = time.monotonic()
                 except OSError as e:
                     logger.debug(
                         "[hot-redundancy][standby] UDP image apply ACK failed: %s",
