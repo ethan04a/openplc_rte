@@ -10,6 +10,7 @@
 #include "plc_state_manager.h"
 #include "plcapp_manager.h"
 #include "scan_cycle_manager.h"
+#include "redundancy_pending.h"
 #include "scan_sync.h"
 #include "utils/log.h"
 #include "utils/utils.h"
@@ -177,6 +178,12 @@ void *plc_cycle_thread(void *arg)
     while (plc_state == PLC_STATE_RUNNING)
     {
         scan_cycle_time_start();
+        scan_sync_notify_scan_start();
+        if (plugin_driver && plugin_driver->shadow_standby)
+        {
+            redundancy_pending_apply_at_barrier();
+        }
+
         holding_buffer_mutex = 1;
         plugin_mutex_take(&plugin_driver->buffer_mutex);
 

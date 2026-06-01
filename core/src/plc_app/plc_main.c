@@ -17,6 +17,7 @@
 #include "plc_state_manager.h"
 #include "plcapp_manager.h"
 #include "scan_cycle_manager.h"
+#include "redundancy_pending.h"
 #include "scan_sync.h"
 #include "unix_socket.h"
 #include "utils/log.h"
@@ -75,6 +76,7 @@ int main(int argc, char *argv[])
     }
 
     scan_sync_init();
+    redundancy_pending_init();
 
     if (log_init(LOG_SOCKET_PATH) < 0)
     {
