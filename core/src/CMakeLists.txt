@@ -67,6 +67,7 @@ add_executable(plc_main
     ${CMAKE_SOURCE_DIR}/core/src/plc_app/image_snapshot_delta.c
     ${CMAKE_SOURCE_DIR}/core/src/plc_app/redundancy_pending.c
     ${CMAKE_SOURCE_DIR}/core/src/plc_app/redundancy_udp.c
+    ${CMAKE_SOURCE_DIR}/core/src/plc_app/redundancy_image_udp.c
     ${CMAKE_SOURCE_DIR}/core/src/plc_app/redundancy_ipc.c
     ${CMAKE_SOURCE_DIR}/core/src/plc_app/journal_buffer.c
     ${CMAKE_SOURCE_DIR}/core/src/plc_app/plc_state_manager.c
