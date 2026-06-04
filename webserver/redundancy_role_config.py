@@ -450,17 +450,28 @@ def write_redundancy_role_standby_backup_cidrs(
     root = role_json_path.parent
     doc = load_redundancy_role_document(root)
     if doc is None:
+        logger.error(
+            "[热冗余] 无法加载 %s，未写入备机同步的 standby_backup",
+            role_json_path,
+        )
         return False
     entries = functional_nics_from_role_document(doc)
     if not entries:
+        logger.error(
+            "[热冗余] %s 中无 functional_nics 条目，无法写入 %d 个备机功能 CIDR",
+            role_json_path,
+            len(standby_backup_cidrs),
+        )
         return False
     try:
         normalized = _normalize_cidr_list(standby_backup_cidrs)
-    except ValueError:
+    except ValueError as e:
+        logger.error("[热冗余] standby_backup CIDR 无效: %s", e)
         return False
     if len(normalized) != len(entries):
-        logger.warning(
-            "[热冗余] 写入 standby_backup 时 CIDR 数量 (%d) 与 functional_nics 数量 (%d) 不一致",
+        logger.error(
+            "[热冗余] 写入 standby_backup 失败: 备机发来 %d 个 CIDR，本机 functional_nics 有 %d 项 "
+            "（主备 redundancy_role.json 中功能网卡数量与顺序须一致）",
             len(normalized),
             len(entries),
         )
@@ -469,4 +480,13 @@ def write_redundancy_role_standby_backup_cidrs(
         entries[i].standby_backup_ipv4_cidr_before_takeover = cidr
     doc[REDUNDANCY_ROLE_KEY_FUNCTIONAL_NICS] = functional_nics_to_json_list(entries)
     save_redundancy_role_document(role_json_path, doc)
+    pairs = ", ".join(
+        f"{e.linux_ifname}={e.standby_backup_ipv4_cidr_before_takeover}" for e in entries
+    )
+    logger.info(
+        "[热冗余] 已写入 %d 项 standby_backup 到 %s: %s",
+        len(entries),
+        role_json_path,
+        pairs,
+    )
     return True
