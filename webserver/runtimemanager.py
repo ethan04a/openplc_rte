@@ -2215,6 +2215,15 @@ class RuntimeManager:
                     local_ip,
                 )
                 first_send_logged = True
+                try:
+                    from webserver.redundancy_program_sync import schedule_master_to_standby_sync
+
+                    schedule_master_to_standby_sync(self)
+                except Exception as e:
+                    logger.error(
+                        "[热冗余][主机] TCP 心跳建立后排程备机程序推送失败: %s",
+                        e,
+                    )
 
             if self._heartbeat_stop.wait(REDUNDANCY_MASTER_HEARTBEAT_INTERVAL_SEC):
                 break

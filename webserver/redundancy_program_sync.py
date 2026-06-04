@@ -1,5 +1,6 @@
 """
-Hot redundancy: after master builds and starts PLC, push the last uploaded ZIP to standby.
+Hot redundancy: push the last uploaded ZIP to standby after master compile success,
+or when master TCP redundancy heartbeat sends its first payload on a new connection.
 Standby receives via /api/redundancy/receive-program (shared secret header).
 """
 
@@ -192,7 +193,7 @@ def push_role_ini_functional_to_standby(
 
 
 def schedule_master_to_standby_sync(runtime_manager: RuntimeManager) -> None:
-    """If this node is redundancy master, push last PLC ZIP to standby after local RUNNING."""
+    """If this node is redundancy master, push last PLC ZIP to standby (async worker)."""
     if not (
         runtime_manager.is_redundancy
         and runtime_manager.is_master
