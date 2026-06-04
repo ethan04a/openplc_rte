@@ -14,6 +14,8 @@
 #include "redundancy_pending.h"
 #include "scan_sync.h"
 
+extern plugin_driver_t *plugin_driver;
+
 #define REDUNDANCY_UDP_PORT 57576
 
 static uint64_t read_be64_local(const uint8_t *p)
@@ -129,7 +131,7 @@ static int peer_addr_matches(const struct sockaddr_in *from, const char *peer_ip
     {
         return 0;
     }
-    return from.sin_addr.s_addr == expected.s_addr;
+    return from->sin_addr.s_addr == expected.s_addr;
 }
 
 static int bind_udp_socket(const char *local_ip, uint16_t port)

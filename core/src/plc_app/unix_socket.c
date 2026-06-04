@@ -358,15 +358,15 @@ void *unix_socket_thread(void *arg)
                         write_all(client_fd, response, strlen(response));
                     }
                 }
-                else if (strncmp(command_buffer, "IMAGE_SNAPSHOT_GET_SCAN_END", 28) == 0 &&
-                         (command_buffer[28] == '\0' || command_buffer[28] == ':'))
+                else if (strncmp(command_buffer, "IMAGE_SNAPSHOT_GET_SCAN_END", 27) == 0 &&
+                         (command_buffer[27] == '\0' || command_buffer[27] == ':'))
                 {
                     uint64_t after_counter = 0;
 
-                    if (command_buffer[28] == ':')
+                    if (command_buffer[27] == ':')
                     {
                         unsigned long long parsed = 0;
-                        if (sscanf(command_buffer + 29, "%llu", &parsed) == 1)
+                        if (sscanf(command_buffer + 28, "%llu", &parsed) == 1)
                         {
                             after_counter = (uint64_t)parsed;
                         }

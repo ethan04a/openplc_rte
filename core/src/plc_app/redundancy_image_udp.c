@@ -3,6 +3,7 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <pthread.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <time.h>
@@ -437,7 +438,7 @@ int redundancy_image_udp_recv_ack(int sock, const struct sockaddr_in *expected_p
     {
         return -1;
     }
-    if (((uint16_t)buf[4] << 8) | buf[5]) != REDUNDANCY_IMAGE_UDP_PROTOCOL_VERSION_V2 ||
+    if ((((uint16_t)buf[4] << 8) | buf[5]) != REDUNDANCY_IMAGE_UDP_PROTOCOL_VERSION_V2 ||
         buf[6] != REDUNDANCY_IMAGE_UDP_ACK_FRAME)
     {
         return -1;
