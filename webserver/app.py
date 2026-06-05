@@ -24,6 +24,7 @@ import flask_login
 from webserver.credentials import CertGen
 from webserver.debug_websocket import init_debug_websocket
 from webserver.logger import get_logger
+from webserver.node_info import register_node_info_routes
 from webserver.plcapp_management import (
     MAX_FILE_SIZE,
     BuildStatus,
@@ -275,6 +276,7 @@ def run_https():
     # rest api register
     from webserver.redundancy_program_sync import register_redundancy_sync_routes
 
+    register_node_info_routes()
     register_redundancy_sync_routes(runtime_manager)
     app_restapi.register_blueprint(restapi_bp, url_prefix="/api")
     register_callback_get(restapi_callback_get)
