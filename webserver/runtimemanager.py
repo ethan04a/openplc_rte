@@ -842,6 +842,185 @@ class RuntimeManager:
         self._image_udp_standby_stats = RedundancyImageUdpStandbyStats()
         self._image_udp_stats_lock = threading.Lock()
         self._plc_image_data_plane_active = False
+        self._heartbeat_status_lock = threading.Lock()
+        self._heartbeat_tcp_state = "disabled"
+        self._heartbeat_local_port: int | None = None
+        self._heartbeat_peer_port: int | None = None
+        self._heartbeat_last_activity_monotonic: float = 0.0
+        self._heartbeat_lost_times: int = 0
+
+    def _reset_heartbeat_tcp_status(self, state: str = "disabled") -> None:
+        with self._heartbeat_status_lock:
+            self._heartbeat_tcp_state = state
+            self._heartbeat_local_port = None
+            self._heartbeat_peer_port = None
+            self._heartbeat_last_activity_monotonic = 0.0
+            self._heartbeat_lost_times = 0
+
+    def _update_heartbeat_tcp_connected(
+        self,
+        local_addr: tuple[str, int],
+        peer_addr: tuple[str, int],
+        *,
+        state: str = "connected",
+    ) -> None:
+        with self._heartbeat_status_lock:
+            self._heartbeat_tcp_state = state
+            self._heartbeat_local_port = local_addr[1]
+            self._heartbeat_peer_port = peer_addr[1]
+            self._heartbeat_last_activity_monotonic = time.monotonic()
+
+    def _update_heartbeat_tcp_disconnected(self) -> None:
+        with self._heartbeat_status_lock:
+            self._heartbeat_tcp_state = "disconnected"
+            self._heartbeat_local_port = None
+            if self.is_master:
+                self._heartbeat_peer_port = REDUNDANCY_HEARTBEAT_PORT
+            else:
+                self._heartbeat_peer_port = None
+
+    def _update_heartbeat_tcp_listening(self, local_ip: str) -> None:
+        with self._heartbeat_status_lock:
+            self._heartbeat_tcp_state = "listening"
+            self._heartbeat_local_port = REDUNDANCY_HEARTBEAT_PORT
+            self._heartbeat_peer_port = None
+            self._heartbeat_last_activity_monotonic = 0.0
+
+    def _touch_heartbeat_activity(self) -> None:
+        with self._heartbeat_status_lock:
+            self._heartbeat_last_activity_monotonic = time.monotonic()
+
+    def _set_heartbeat_lost_times(self, lost_times: int) -> None:
+        with self._heartbeat_status_lock:
+            self._heartbeat_lost_times = lost_times
+
+    def format_plc_status_for_api(self, raw_status: str | None) -> str:
+        """Map unix STATUS response to API string; shadow standby uses RUNNING shadow."""
+        if raw_status is None:
+            return "No response from runtime"
+        if (
+            raw_status == "STATUS:RUNNING"
+            and self.is_redundancy
+            and not self.is_master
+            and self._plc_shadow_standby
+        ):
+            return "STATUS:RUNNING shadow"
+        return raw_status
+
+    def get_redundancy_heartbeat_status(self) -> dict[str, Any]:
+        with self._heartbeat_status_lock:
+            connection_state = self._heartbeat_tcp_state
+            local_port = self._heartbeat_local_port
+            peer_port = self._heartbeat_peer_port
+            last_activity = self._heartbeat_last_activity_monotonic
+            lost_times = self._heartbeat_lost_times
+
+        if not self.is_redundancy:
+            role = "none"
+        elif self.is_master:
+            role = "master"
+        else:
+            role = "standby"
+
+        peer_ip = (
+            self._redundancy_standby_ip if self.is_master else self._redundancy_master_ip
+        )
+        return {
+            "enabled": self.is_redundancy,
+            "role": role,
+            "transport": "tcp",
+            "heartbeat_port": REDUNDANCY_HEARTBEAT_PORT,
+            "local_ip": self._redundancy_local_heartbeat_ip,
+            "local_port": local_port,
+            "peer_ip": peer_ip,
+            "peer_port": peer_port,
+            "connection_state": connection_state,
+            "last_activity_monotonic": last_activity,
+            "lost_times": lost_times,
+            "promoted_acting_master": self._promoted_standby_acting_master,
+            "updated_monotonic": time.monotonic(),
+        }
+
+    def get_redundancy_image_udp_status(self) -> dict[str, Any]:
+        with self._image_udp_stats_lock:
+            if self.is_redundancy and self.is_master:
+                stats = _redundancy_image_master_stats_to_dict(self._image_udp_master_stats)
+                role = "master"
+            elif self.is_redundancy:
+                stats = _redundancy_image_standby_stats_to_dict(self._image_udp_standby_stats)
+                role = "standby"
+            else:
+                stats = {}
+                role = "none"
+
+        plc_sync: dict[str, Any] = {}
+        if self._plc_image_data_plane_active:
+            plc_sync = self._fetch_plc_redundancy_sync_status()
+
+        peer_ip = (
+            self._redundancy_standby_ip if self.is_master else self._redundancy_master_ip
+        )
+        data_plane = "plc_main" if self._plc_image_data_plane_active else "webserver"
+
+        if role == "master":
+            has_sent_udp = (
+                stats.get("frame_send_count", 0) > 0
+                or stats.get("last_send_frame_seq", 0) > 0
+            )
+            if not has_sent_udp and plc_sync:
+                active_session = int(plc_sync.get("active_session_id", 0) or 0)
+                has_sent_udp = (
+                    str(plc_sync.get("running", "")).lower() == "true"
+                    and str(plc_sync.get("data_plane_mode", "")) == "master_sender"
+                    and active_session > 0
+                )
+            payload: dict[str, Any] = {
+                "enabled": self.is_redundancy,
+                "role": role,
+                "udp_port": REDUNDANCY_IMAGE_SYNC_PORT,
+                "data_plane": data_plane,
+                "has_sent_udp": has_sent_udp,
+                "last_send_monotonic": stats.get("last_send_monotonic", 0.0),
+                "frame_send_count": stats.get("frame_send_count", 0),
+                "last_send_frame_seq": stats.get("last_send_frame_seq", 0),
+                "peer_ip": peer_ip,
+            }
+        elif role == "standby":
+            has_received_udp = (
+                stats.get("fragment_rx_count", 0) > 0
+                or stats.get("frame_complete_count", 0) > 0
+                or stats.get("last_applied_seq", 0) > 0
+            )
+            if not has_received_udp and plc_sync:
+                has_received_udp = int(plc_sync.get("last_applied_seq", 0) or 0) > 0
+            payload = {
+                "enabled": self.is_redundancy,
+                "role": role,
+                "udp_port": REDUNDANCY_IMAGE_SYNC_PORT,
+                "data_plane": data_plane,
+                "has_received_udp": has_received_udp,
+                "last_frame_complete_monotonic": stats.get(
+                    "last_frame_complete_monotonic", 0.0
+                ),
+                "fragment_rx_count": stats.get("fragment_rx_count", 0),
+                "last_applied_seq": stats.get("last_applied_seq", 0),
+                "peer_ip": peer_ip,
+            }
+        else:
+            payload = {
+                "enabled": False,
+                "role": role,
+                "udp_port": REDUNDANCY_IMAGE_SYNC_PORT,
+                "data_plane": data_plane,
+                "has_sent_udp": False,
+                "has_received_udp": False,
+                "peer_ip": None,
+            }
+
+        if plc_sync:
+            payload["plc_sync"] = plc_sync
+        payload["updated_monotonic"] = time.monotonic()
+        return payload
 
     def _fetch_plc_redundancy_sync_status(self) -> dict[str, Any]:
         """Read plc_main REDUNDANCY_SYNC_STATUS when the C UDP data plane is active."""
@@ -1678,6 +1857,7 @@ class RuntimeManager:
                 "[热冗余] 未找到 %s，本机不启用热冗余功能（is_redundancy=False, is_master=False）。",
                 role_json_path,
             )
+            self._reset_heartbeat_tcp_status()
             return
 
         doc = load_redundancy_role_document(project_root)
@@ -1685,6 +1865,7 @@ class RuntimeManager:
             logger.info(
                 "[热冗余] 冗余角色文件无效或无法解析，本机不启用热冗余功能（is_redundancy=False, is_master=False）。"
             )
+            self._reset_heartbeat_tcp_status()
             return
 
         self._redundancy_heartbeat_nic = redundancy_heartbeat_nic_from_role_document(doc)
@@ -1707,6 +1888,7 @@ class RuntimeManager:
                 REDUNDANCY_ROLE_KEY_MASTER_REDUNDANCY_IPV4,
                 REDUNDANCY_ROLE_KEY_STANDBY_REDUNDANCY_IPV4,
             )
+            self._reset_heartbeat_tcp_status()
             return
 
         logger.info(
@@ -1733,6 +1915,7 @@ class RuntimeManager:
                 "请确认网卡存在且已配置地址。",
                 self._redundancy_heartbeat_nic,
             )
+            self._reset_heartbeat_tcp_status()
             return
 
         logger.info(
@@ -1784,6 +1967,7 @@ class RuntimeManager:
             master_ip,
             standby_ip,
         )
+        self._reset_heartbeat_tcp_status()
 
     def reload_functional_nics_from_disk(self) -> None:
         """Reload functional_nics[] from redundancy_role.json (e.g. after host CIDR sync)."""
@@ -2133,6 +2317,9 @@ class RuntimeManager:
         peer_ip = self._redundancy_standby_ip
         if not local_ip or not peer_ip:
             return
+        self._reset_heartbeat_tcp_status("disconnected")
+        with self._heartbeat_status_lock:
+            self._heartbeat_peer_port = REDUNDANCY_HEARTBEAT_PORT
         sock: socket.socket | None = None
         first_send_logged = False
         master_hb_ever_connected = False
@@ -2145,6 +2332,10 @@ class RuntimeManager:
                     sock.settimeout(10.0)
                     sock.connect((peer_ip, REDUNDANCY_HEARTBEAT_PORT))
                     local_ep = sock.getsockname()
+                    self._update_heartbeat_tcp_connected(
+                        local_ep,
+                        (peer_ip, REDUNDANCY_HEARTBEAT_PORT),
+                    )
                     if master_hb_ever_connected:
                         logger.info(
                             "[热冗余][主机] 已重新连接备机 TCP %s:%d（本机 %s:%d，冗余口 %s）。",
@@ -2180,6 +2371,7 @@ class RuntimeManager:
                         except OSError:
                             pass
                         sock = None
+                    self._update_heartbeat_tcp_disconnected()
                     if self._heartbeat_stop.wait(REDUNDANCY_MASTER_HEARTBEAT_INTERVAL_SEC):
                         break
                     continue
@@ -2203,9 +2395,12 @@ class RuntimeManager:
                 except OSError:
                     pass
                 sock = None
+                self._update_heartbeat_tcp_disconnected()
                 if self._heartbeat_stop.wait(REDUNDANCY_MASTER_HEARTBEAT_INTERVAL_SEC):
                     break
                 continue
+
+            self._touch_heartbeat_activity()
 
             if not first_send_logged:
                 logger.info(
@@ -2233,6 +2428,7 @@ class RuntimeManager:
                 sock.close()
             except OSError:
                 pass
+        self._update_heartbeat_tcp_disconnected()
         logger.info("[热冗余][主机] TCP 心跳发送线程已退出。")
 
     def _redundancy_standby_tcp_heartbeat_loop(self) -> None:
@@ -2257,9 +2453,12 @@ class RuntimeManager:
                 REDUNDANCY_HEARTBEAT_PORT,
             )
             server.settimeout(REDUNDANCY_STANDBY_RECV_IDLE_SEC)
+            self._update_heartbeat_tcp_listening(local_ip)
             while not self._heartbeat_stop.is_set():
                 promoted = self._standby_switched_to_master and self._promoted_standby_acting_master
                 if promoted:
+                    with self._heartbeat_status_lock:
+                        self._heartbeat_tcp_state = "promoted_listening"
                     try:
                         client, addr = server.accept()
                     except TimeoutError:
@@ -2284,6 +2483,11 @@ class RuntimeManager:
                         addr[0],
                         addr[1],
                     )
+                    self._update_heartbeat_tcp_connected(
+                        (local_ip, REDUNDANCY_HEARTBEAT_PORT),
+                        addr,
+                        state="promoted_connected",
+                    )
                     buf = b""
                     client_live = client
                     try:
@@ -2306,6 +2510,7 @@ class RuntimeManager:
                             buf, heartbeat_seen = self._consume_standby_redundancy_tcp_buffer(buf)
                             if heartbeat_seen:
                                 logger.info("[热冗余][备机] 收到原主机心跳，触发自动回切")
+                                self._touch_heartbeat_activity()
                                 self._schedule_async_failback_to_standby()
                                 try:
                                     client_live.close()
@@ -2321,12 +2526,14 @@ class RuntimeManager:
                                 client_live.close()
                             except OSError:
                                 pass
+                    self._update_heartbeat_tcp_listening(local_ip)
                     continue
 
                 try:
                     client, addr = server.accept()
                 except TimeoutError:
                     lost_times += 1
+                    self._set_heartbeat_lost_times(lost_times)
                     lost_times, _ = self._standby_tick_lost_times(lost_times)
                     continue
                 except OSError as e:
@@ -2341,6 +2548,11 @@ class RuntimeManager:
                     addr[1],
                 )
                 lost_times = 0
+                self._set_heartbeat_lost_times(0)
+                self._update_heartbeat_tcp_connected(
+                    (local_ip, REDUNDANCY_HEARTBEAT_PORT),
+                    addr,
+                )
                 buf = b""
                 try:
                     client.settimeout(REDUNDANCY_STANDBY_RECV_IDLE_SEC)
@@ -2352,6 +2564,7 @@ class RuntimeManager:
                             chunk = client.recv(4096)
                         except (TimeoutError, socket.timeout):
                             lost_times += 1
+                            self._set_heartbeat_lost_times(lost_times)
                             if lost_times > REDUNDANCY_STANDBY_LOST_THRESHOLD_SEC:
                                 logger.info("[热冗余][备机] LostTimes 增加到 %d", lost_times)
                             lost_times, switched = self._standby_tick_lost_times(lost_times)
@@ -2370,17 +2583,21 @@ class RuntimeManager:
                         buf, heartbeat_seen = self._consume_standby_redundancy_tcp_buffer(buf)
                         if heartbeat_seen:
                             lost_times = 0
+                            self._set_heartbeat_lost_times(0)
+                            self._touch_heartbeat_activity()
                 finally:
                     try:
                         client.close()
                     except OSError:
                         pass
+                    self._update_heartbeat_tcp_listening(local_ip)
         finally:
             if server is not None:
                 try:
                     server.close()
                 except OSError:
                     pass
+            self._reset_heartbeat_tcp_status("disabled")
             logger.info("[热冗余][备机] TCP 心跳监听线程已退出。")
 
     def _redundancy_image_sync_master_loop(self) -> None:

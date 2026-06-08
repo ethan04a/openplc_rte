@@ -21,7 +21,11 @@ from webserver.plcapp_management import (
     apply_program_zip_upload,
     build_state,
 )
-from webserver.redundancy_role_config import REDUNDANCY_ROLE_FILENAME, write_redundancy_role_functional_cidrs
+from webserver.redundancy_role_config import (
+    REDUNDANCY_ROLE_FILENAME,
+    load_redundancy_role_document,
+    write_redundancy_role_functional_cidrs,
+)
 from webserver.restapi import restapi_bp
 from webserver.runtimemanager import REDUNDANCY_SYNC_SECRET, RuntimeManager
 
@@ -115,6 +119,27 @@ def register_redundancy_sync_routes(runtime_manager: RuntimeManager) -> None:
             len(cidrs),
         )
         return jsonify({"ok": True}), 200
+
+    @restapi_bp.route("/redundancy/role-config", methods=["GET"])
+    @jwt_required()
+    def redundancy_role_config():
+        """Return parsed redundancy_role.json content (not a file download)."""
+        doc = load_redundancy_role_document(RuntimeManager._openplc_project_root())
+        if doc is None:
+            return jsonify({"error": "redundancy_role.json not found or invalid"}), 404
+        return jsonify(doc), 200
+
+    @restapi_bp.route("/redundancy/heartbeat-status", methods=["GET"])
+    @jwt_required()
+    def redundancy_heartbeat_status():
+        """TCP redundancy heartbeat connection observability."""
+        return jsonify(runtime_manager.get_redundancy_heartbeat_status()), 200
+
+    @restapi_bp.route("/redundancy/image-udp-status", methods=["GET"])
+    @jwt_required()
+    def redundancy_image_udp_status():
+        """UDP I/O image sync send/receive observability."""
+        return jsonify(runtime_manager.get_redundancy_image_udp_status()), 200
 
     @restapi_bp.route("/redundancy/image-sync-status", methods=["GET"])
     @jwt_required()

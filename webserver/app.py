@@ -149,10 +149,9 @@ def parse_timing_stats(stats_response: Optional[str]) -> Optional[dict]:
 
 def handle_status(data: dict) -> dict:
     response = runtime_manager.status_plc()
+    result: dict = {"status": runtime_manager.format_plc_status_for_api(response)}
     if response is None:
-        return {"status": "No response from runtime"}
-
-    result: dict = {"status": response}
+        return result
 
     # Only fetch timing stats if explicitly requested via include_stats parameter.
     # This avoids acquiring the stats mutex on every status poll, which could
