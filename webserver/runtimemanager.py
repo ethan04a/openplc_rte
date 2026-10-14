@@ -22,6 +22,12 @@ except ImportError:
     HAS_PSUTIL = False
 
 from webserver.logger import get_logger
+from webserver.redundancy_identity import (
+    REDUNDANCY_IDENTITY_STATE_FILENAME,
+    IdentityExchange,
+    IdentityOutcome,
+    RedundancyIdentityAgent,
+)
 from webserver.redundancy_role_config import (
     DEFAULT_REDUNDANCY_HEARTBEAT_NIC_LINUX_IFNAME,
     FunctionalNicRole,
@@ -828,8 +834,9 @@ class RuntimeManager:
         self._standby_switched_to_master = False
         # True → plc_main 影子备机；暂时升主后为 False（非影子 PLC）
         self._plc_shadow_standby = False
-        # 备机已暂时升主且 PLC 非影子（永久 is_master 仍由 redundancy_role.json 中冗余口对端 IPv4 决定）
+        # 备机已暂时升主且 PLC 非影子。启动时的 is_master 由身份确认写入，不由心跳地址直接决定。
         self._promoted_standby_acting_master = False
+        self._identity_exchange: IdentityExchange | None = None
         # 备升主过程中避免 monitor 线程误重启 PLC
         self._manual_plc_restart_in_progress = False
         # 主机本地记录完成后，等待“TCP 心跳已连接备机”时再同步 functional_nics 中 permanent_master_* 到备机
@@ -1837,8 +1844,10 @@ class RuntimeManager:
 
     def _evaluate_redundancy_role(self) -> None:
         """
-        Load redundancy_role.json: first resolve NIC names, then compare local heartbeat-NIC IPv4
-        to configured master/standby to set is_master / is_redundancy.
+        Load redundancy_role.json and decide whether this machine is in the redundant pair.
+
+        Matching a configured heartbeat address only enables redundancy. A/B is confirmed
+        afterwards and then written into is_master and the shadow flag.
         """
         self.is_master = False
         self.is_redundancy = False
@@ -1925,39 +1934,15 @@ class RuntimeManager:
             local_ip,
         )
 
-        if local_ip == master_ip:
-            self.is_redundancy = True
-            self.is_master = True
-            logger.info(
-                "[热冗余] 本机 IPv4 与配置中的主机一致，角色=主机。"
-                "is_redundancy=True, is_master=True。"
-                "将通过 TCP 经 %s 主动连接备机并每秒发送心跳（目标端口 %d）。",
-                self._redundancy_heartbeat_nic,
-                REDUNDANCY_HEARTBEAT_PORT,
-            )
-            threading.Thread(
-                target=self._record_functional_ips_and_sync_standby_thread,
-                daemon=True,
-                name="redundancy-record-functional-ip",
-            ).start()
-            return
-
-        if local_ip == standby_ip:
+        if local_ip in (master_ip, standby_ip):
             self.is_redundancy = True
             self.is_master = False
-            self._plc_shadow_standby = not self._standby_switched_to_master
+            self._plc_shadow_standby = False
             logger.info(
-                "[热冗余] 本机 IPv4 与配置中的备机一致，角色=备机。"
-                "is_redundancy=True, is_master=False。"
-                "将在 %s 上监听 TCP 端口 %d，接收主机心跳。",
-                self._redundancy_heartbeat_nic,
-                REDUNDANCY_HEARTBEAT_PORT,
+                "[热冗余] 本机心跳地址 %s 属于冗余对。身份确认完成前不启动 PLC，"
+                "也不启动 TCP 心跳。",
+                local_ip,
             )
-            if self._plc_shadow_standby:
-                logger.info(
-                    "[热冗余] 备机将使用 plc_main --shadow-standby：运行相同 PLC 逻辑，"
-                    "不加载现场 I/O 插件（仅与主机冗余通信由 Web 层负责）。"
-                )
             return
 
         logger.warning(
@@ -1969,6 +1954,54 @@ class RuntimeManager:
             standby_ip,
         )
         self._reset_heartbeat_tcp_status()
+
+    def _apply_confirmed_identity(self, outcome: IdentityOutcome) -> bool:
+        """Write a committed A/B result into the flags the existing runtime already reads."""
+        if not outcome.local_committed or outcome.role not in ("A", "B"):
+            logger.warning(
+                "[热冗余] 身份未确认（%s），不进入主备启动路径。",
+                outcome.reason or outcome.status,
+            )
+            return False
+        if outcome.role == "A":
+            self.is_master = True
+            self._plc_shadow_standby = False
+            logger.info("[热冗余] 身份确认为 A／主，按非影子方式启动 PLC。")
+            return True
+        self.is_master = False
+        self._plc_shadow_standby = True
+        logger.info("[热冗余] 身份确认为 B／备，按影子方式启动 PLC。")
+        return True
+
+    def _confirm_redundancy_identity(self) -> bool:
+        """Block until identity settles. Unconfirmed does not start the PLC or heartbeat."""
+        local_ip = self._redundancy_local_heartbeat_ip
+        peer_ip = self._redundancy_peer_heartbeat_ip()
+        if not local_ip or not peer_ip:
+            logger.error("[热冗余] 缺少本机或对端心跳地址，不启动 PLC。")
+            return False
+        if self._identity_exchange is not None:
+            self._identity_exchange.stop()
+        agent = RedundancyIdentityAgent(
+            local_ip,
+            peer_ip,
+            state_path=self._openplc_project_root() / REDUNDANCY_IDENTITY_STATE_FILENAME,
+        )
+        exchange = IdentityExchange(agent)
+        self._identity_exchange = exchange
+        exchange.start()
+        exchange.wait_settled(21)
+        if not self._apply_confirmed_identity(agent.outcome):
+            exchange.stop()
+            self._identity_exchange = None
+            return False
+        if self.is_master:
+            threading.Thread(
+                target=self._record_functional_ips_and_sync_standby_thread,
+                daemon=True,
+                name="redundancy-record-functional-ip",
+            ).start()
+        return True
 
     def reload_functional_nics_from_disk(self) -> None:
         """Reload functional_nics[] from redundancy_role.json (e.g. after host CIDR sync)."""
@@ -3129,6 +3162,9 @@ class RuntimeManager:
             return
 
         self._evaluate_redundancy_role()
+        if self.is_redundancy and not self._confirm_redundancy_identity():
+            logger.warning("[热冗余] 身份未确认，不启动 PLC，也不启动冗余心跳。")
+            return
 
         self.running = True
 

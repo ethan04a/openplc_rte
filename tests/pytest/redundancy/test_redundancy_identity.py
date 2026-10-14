@@ -6,6 +6,7 @@ from pathlib import Path
 
 from webserver.redundancy_identity import (
     BASIS_COMPETITION,
+    IdentityExchange,
     BASIS_JOIN_INCUMBENT,
     BASIS_RESTORED,
     BASIS_SOLO_NO_PEER,
@@ -406,3 +407,40 @@ def test_identity_datagram_roundtrip_on_udp_port() -> None:
         client.close()
         server.close()
     assert unpack_identity_message(received) == message
+
+
+def test_udp_exchange_elects_smaller_address_and_keeps_listening(tmp_path: Path) -> None:
+    small_ip = "127.0.0.1"
+    large_ip = "127.0.0.2"
+    try:
+        probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        probe.bind((large_ip, 0))
+        probe.close()
+    except OSError:
+        return
+    small = RedundancyIdentityAgent(
+        small_ip,
+        large_ip,
+        state_path=tmp_path / "small.json",
+        startup_instance="small",
+    )
+    large = RedundancyIdentityAgent(
+        large_ip,
+        small_ip,
+        state_path=tmp_path / "large.json",
+        startup_instance="large",
+    )
+    left = IdentityExchange(small)
+    right = IdentityExchange(large)
+    left.start()
+    right.start()
+    try:
+        assert left.wait_settled(8)
+        assert right.wait_settled(8)
+        assert small.outcome.role == "A"
+        assert large.outcome.role == "B"
+        assert small.outcome.session_id == large.outcome.session_id
+        assert small.outcome.local_committed is True
+    finally:
+        left.stop()
+        right.stop()

@@ -1,7 +1,9 @@
 """Unit tests for redundancy REST API helpers on RuntimeManager."""
 
 import threading
+from pathlib import Path
 
+from webserver.redundancy_identity import BASIS_COMPETITION, BASIS_JOIN_INCUMBENT, IdentityOutcome
 from webserver.runtimemanager import (
     RedundancyImageUdpMasterStats,
     RedundancyImageUdpStandbyStats,
@@ -107,6 +109,72 @@ def test_image_udp_status_peer_ip_follows_local_heartbeat_address():
 
     payload = rm.get_redundancy_image_udp_status()
     assert payload["peer_ip"] == "192.168.100.20"
+
+
+def test_apply_confirmed_identity_sets_existing_role_flags() -> None:
+    rm = _bare_runtime_manager()
+    master = IdentityOutcome(
+        status="confirmed",
+        role="A",
+        session_id="s",
+        basis=BASIS_COMPETITION,
+        local_committed=True,
+        peer_confirmed=True,
+        master_ip="192.168.100.10",
+        reason=None,
+    )
+    assert rm._apply_confirmed_identity(master) is True
+    assert rm.is_master is True
+    assert rm._plc_shadow_standby is False
+
+    standby = IdentityOutcome(
+        status="confirmed",
+        role="B",
+        session_id="s",
+        basis=BASIS_JOIN_INCUMBENT,
+        local_committed=True,
+        peer_confirmed=True,
+        master_ip="192.168.100.10",
+        reason=None,
+    )
+    assert rm._apply_confirmed_identity(standby) is True
+    assert rm.is_master is False
+    assert rm._plc_shadow_standby is True
+
+
+def test_apply_unconfirmed_identity_does_not_assume_master() -> None:
+    rm = _bare_runtime_manager()
+    outcome = IdentityOutcome(
+        status="unconfirmed",
+        role=None,
+        session_id=None,
+        basis=None,
+        local_committed=False,
+        peer_confirmed=False,
+        master_ip=None,
+        reason="协商重试耗尽，保持未确认",
+    )
+    assert rm._apply_confirmed_identity(outcome) is False
+    assert rm.is_master is False
+    assert rm._plc_shadow_standby is False
+
+
+def test_start_does_not_launch_plc_when_identity_is_unconfirmed(tmp_path: Path) -> None:
+    rm = RuntimeManager(
+        "/bin/true",
+        str(tmp_path / "plc.sock"),
+        str(tmp_path / "log.sock"),
+    )
+
+    def evaluate() -> None:
+        rm.is_redundancy = True
+        rm.is_master = False
+
+    rm._evaluate_redundancy_role = evaluate  # type: ignore[method-assign]
+    rm._confirm_redundancy_identity = lambda: False  # type: ignore[method-assign]
+    rm.start()
+    assert rm.running is False
+    assert rm.process is None
 
 
 def test_get_redundancy_image_udp_status_master_not_sent():

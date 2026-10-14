@@ -19,6 +19,9 @@ core/src/drivers/plugins/native/s7comm/s7comm_config.json
 __pycache__/
 .clinerules
 
+# Per-machine hot-redundancy identity. Not the shared role configuration.
+redundancy_identity_state.json
+
 # Temporary files
 *.txt
 *.log

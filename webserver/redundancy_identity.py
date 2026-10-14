@@ -12,6 +12,8 @@ from __future__ import annotations
 import ipaddress
 import json
 import socket
+import threading
+import time
 import uuid
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -797,3 +799,109 @@ def bind_identity_socket(local_ip: str, port: int = REDUNDANCY_IDENTITY_PORT) ->
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     sock.bind((local_ip, port))
     return sock
+
+
+class IdentityExchange:
+    """Exchange identity datagrams until the agent settles, then keep answering."""
+
+    def __init__(
+        self,
+        agent: RedundancyIdentityAgent,
+        *,
+        port: int = REDUNDANCY_IDENTITY_PORT,
+        peer_port: int | None = None,
+        step_ms: int = 50,
+        limit_ms: int = 20000,
+    ) -> None:
+        self.agent = agent
+        self.port = port
+        self.peer_port = port if peer_port is None else peer_port
+        self._step_ms = step_ms
+        self._limit_ms = limit_ms
+        self._stop = threading.Event()
+        self._settled = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        self._thread = threading.Thread(
+            target=self._loop,
+            name="redundancy-identity",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def wait_settled(self, timeout_sec: float) -> bool:
+        return self._settled.wait(timeout_sec)
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=2)
+            self._thread = None
+
+    def _loop(self) -> None:
+        try:
+            sock = bind_identity_socket(self.agent.local_ip, self.port)
+        except OSError as exc:
+            logger.error(
+                "[热冗余][身份] 绑定 %s:%s 失败: %s",
+                self.agent.local_ip,
+                self.port,
+                exc,
+            )
+            self._settled.set()
+            return
+        sock.setblocking(False)
+        started = time.monotonic()
+        self.agent.start(0)
+        try:
+            while not self._stop.is_set():
+                elapsed = int((time.monotonic() - started) * 1000)
+                self._exchange(sock, elapsed)
+                if not self._settled.is_set():
+                    outcome = self.agent.outcome
+                    timed_out = elapsed >= self._limit_ms
+                    terminal = (
+                        outcome.local_committed
+                        or outcome.status == "conflict"
+                        or bool(outcome.reason)
+                        or timed_out
+                    )
+                    if terminal:
+                        self._settled.set()
+                        if not outcome.local_committed:
+                            logger.warning(
+                                "[热冗余][身份] %s 未确认身份: %s",
+                                self.agent.local_ip,
+                                outcome.reason or outcome.status,
+                            )
+                            break
+                        logger.info(
+                            "[热冗余][身份] %s 已确认角色 %s，继续应答后续加入",
+                            self.agent.local_ip,
+                            outcome.role,
+                        )
+                if self._stop.wait(self._step_ms / 1000):
+                    break
+        finally:
+            sock.close()
+            self._settled.set()
+
+    def _exchange(self, sock: socket.socket, now_ms: int) -> None:
+        for packet in self.agent.poll(now_ms):
+            try:
+                sock.sendto(packet, (self.agent.peer_ip, self.peer_port))
+            except OSError:
+                continue
+        while True:
+            try:
+                payload, addr = sock.recvfrom(65535)
+            except BlockingIOError:
+                break
+            if addr[0] != self.agent.peer_ip:
+                continue
+            for reply in self.agent.handle(payload, now_ms):
+                try:
+                    sock.sendto(reply, (self.agent.peer_ip, self.peer_port))
+                except OSError:
+                    continue
