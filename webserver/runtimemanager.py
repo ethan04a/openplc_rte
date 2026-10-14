@@ -832,10 +832,12 @@ class RuntimeManager:
         self._heartbeat_threads: list[threading.Thread] = []
         # 备机升主并完成现场 I/O 切换后为 True。身份写成 A 后不再因原主机心跳回切。
         self._standby_switched_to_master = False
-        # True → plc_main 影子备机；暂时升主后为 False（非影子 PLC）
+        # True → plc_main 影子备机；现场 I/O 切换成功后为 False。
         self._plc_shadow_standby = False
-        # 备机已暂时升主且 PLC 非影子。启动时的 is_master 由身份确认写入，不由心跳地址直接决定。
+        # 现场 I/O 已经切到本机。切换未完成时保持 False，备机继续收镜像。
         self._promoted_standby_acting_master = False
+        # 升主已经开始改功能 IP 或切换 PLC。失败后保持 True，避免再自动改一遍地址。
+        self._takeover_in_progress = False
         self._identity_exchange: IdentityExchange | None = None
         # 备升主过程中避免 monitor 线程误重启 PLC
         self._manual_plc_restart_in_progress = False
@@ -1856,6 +1858,7 @@ class RuntimeManager:
         self._redundancy_local_heartbeat_ip = None
         self._plc_shadow_standby = False
         self._promoted_standby_acting_master = False
+        self._takeover_in_progress = False
         self._redundancy_heartbeat_nic = DEFAULT_REDUNDANCY_HEARTBEAT_NIC_LINUX_IFNAME
         self._redundancy_functional_nics = []
 
@@ -2175,6 +2178,7 @@ class RuntimeManager:
                 REDUNDANCY_ROLE_KEY_FUNCTIONAL_NICS,
             )
             return
+        applied_any = False
         for entry, master_cidr, backup_cidr in zip(
             self._redundancy_functional_nics, permanent_cidrs, standby_backups
         ):
@@ -2189,12 +2193,19 @@ class RuntimeManager:
                 master_cidr,
                 remove_cidr=backup_cidr,
             ):
+                if applied_any:
+                    self._takeover_in_progress = True
+                    logger.error(
+                        "[热冗余][备机] 功能 IP 已改了一部分，保持备机，不把身份写成 A，也不自动重做。"
+                    )
+                else:
+                    logger.error(
+                        "[热冗余][备机] 功能 IP 尚未改动，升主中止，允许之后再次尝试。"
+                    )
                 return
+            applied_any = True
 
-        self._standby_switched_to_master = True
-        self._plc_shadow_standby = False
-        self._promoted_standby_acting_master = True
-
+        self._takeover_in_progress = True
         switched = False
         try:
             if self._try_redundancy_shadow_exit():
@@ -2211,7 +2222,9 @@ class RuntimeManager:
 
     def _finish_standby_takeover(self, switched: bool) -> None:
         if not switched:
-            logger.error("[热冗余][备机] 现场 I/O 未切换成功，不把身份写成 A。")
+            logger.error(
+                "[热冗余][备机] 现场 I/O 未切换成功，保持备机并继续接收镜像，不把身份写成 A。"
+            )
             return
         self._publish_takeover_identity()
 
@@ -2360,6 +2373,8 @@ class RuntimeManager:
         """
         if lost_times <= REDUNDANCY_STANDBY_LOST_THRESHOLD_SEC:
             return lost_times, False
+        if self._takeover_in_progress or self._promoted_standby_acting_master:
+            return lost_times, False
         if self._redundancy_ping_master_reachable():
             logger.info(
                 "[热冗余][备机] LostTimes=%d 已超过阈值 %d 秒，但功能网卡 %s 上仍有可达的主机地址，清零计数。",
@@ -2373,6 +2388,8 @@ class RuntimeManager:
 
     def _schedule_async_standby_to_master_switch(self) -> None:
         """备机心跳线程内触发升主须异步执行，避免 shutdown/join 当前线程死锁。"""
+        if self._takeover_in_progress or self._promoted_standby_acting_master:
+            return
 
         def runner() -> None:
             time.sleep(0.05)

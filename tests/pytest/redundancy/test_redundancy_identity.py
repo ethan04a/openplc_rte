@@ -394,6 +394,65 @@ def test_takeover_does_not_demote_a_still_running_original_master(tmp_path: Path
     assert large.outcome.master_ip == IP_LARGE
 
 
+def test_saved_standby_stays_standby_when_peer_is_silent(tmp_path: Path) -> None:
+    path = tmp_path / "state.json"
+    save_identity_record(path, _record(IP_LARGE, IP_SMALL, "B", "old-session", IP_SMALL))
+    agent = _agent(IP_LARGE, IP_SMALL, path)
+    agent.start(0)
+    now = 0
+    while now <= 5000:
+        agent.poll(now)
+        now += 50
+    assert agent.outcome.role == "B"
+    assert agent.outcome.basis == BASIS_RESTORED
+    assert agent.outcome.master_ip == IP_SMALL
+    assert agent.outcome.session_id == "old-session"
+
+
+def test_saved_master_is_restored_when_peer_is_silent(tmp_path: Path) -> None:
+    path = tmp_path / "state.json"
+    save_identity_record(path, _record(IP_LARGE, IP_SMALL, "A", "old-session", IP_LARGE))
+    agent = _agent(IP_LARGE, IP_SMALL, path)
+    agent.start(0)
+    now = 0
+    while now <= 5000:
+        agent.poll(now)
+        now += 50
+    assert agent.outcome.role == "A"
+    assert agent.outcome.basis == BASIS_RESTORED
+    assert agent.outcome.master_ip == IP_LARGE
+    assert agent.outcome.session_id == "old-session"
+
+
+def test_saved_master_joins_peer_during_restore_wait(tmp_path: Path) -> None:
+    path = tmp_path / "state.json"
+    save_identity_record(path, _record(IP_SMALL, IP_LARGE, "A", "old-session", IP_SMALL))
+    agent = _agent(IP_SMALL, IP_LARGE, path)
+    agent.start(0)
+    agent.poll(3000)
+    assert agent.outcome.local_committed is False
+    peer = IdentityMessage(
+        msg_type="query",
+        startup_instance="peer",
+        local_ip=IP_LARGE,
+        peer_ip=IP_SMALL,
+        has_valid_master=True,
+        local_committed=True,
+        session_id="takeover-session",
+        role="A",
+        basis=BASIS_TAKEOVER_FACT,
+        master_ip=IP_LARGE,
+    )
+    agent.handle(pack_identity_message(peer), 3500)
+    assert agent.outcome.role == "B"
+    assert agent.outcome.basis == BASIS_JOIN_INCUMBENT
+    assert agent.outcome.master_ip == IP_LARGE
+    assert agent.outcome.session_id == "takeover-session"
+    agent.poll(5000)
+    assert agent.outcome.role == "B"
+    assert agent.outcome.session_id == "takeover-session"
+
+
 def test_takeover_fact_records_local_master_without_election(tmp_path: Path) -> None:
     agent = _agent(IP_LARGE, IP_SMALL, tmp_path / "state.json")
     agent.commit_takeover_fact()

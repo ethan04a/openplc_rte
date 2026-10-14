@@ -48,6 +48,7 @@ MSG_REVOKE = "revoke"
 
 _PHASE_DISCOVER = "discover"
 _PHASE_SOLO_WAIT = "solo_wait"
+_PHASE_RESTORE_WAIT = "restore_wait"
 _PHASE_COMPETE = "compete_wait"
 _PHASE_QUERY_PEER = "query_peer"
 _PHASE_COMMITTED = "committed"
@@ -325,6 +326,13 @@ class RedundancyIdentityAgent:
                 self._next_send_ms = now_ms + REDUNDANCY_IDENTITY_QUERY_INTERVAL_MS
                 return [self._pack_query()]
             return []
+        if self._phase == _PHASE_RESTORE_WAIT:
+            if now_ms >= self._deadline_ms:
+                return self._restore_saved_after_silence()
+            if now_ms >= self._next_send_ms:
+                self._next_send_ms = now_ms + REDUNDANCY_IDENTITY_QUERY_INTERVAL_MS
+                return [self._pack_query()]
+            return []
         if self._phase == _PHASE_SOLO_WAIT and now_ms >= self._deadline_ms:
             return self._finish_solo()
         if self._phase in (_PHASE_COMPETE, _PHASE_QUERY_PEER) and now_ms >= self._deadline_ms:
@@ -460,15 +468,40 @@ class RedundancyIdentityAgent:
             ),
         )
 
-    def _mark_conflict(self) -> None:
+    def _mark_conflict(self, message: IdentityMessage | None = None) -> None:
         if self._phase == _PHASE_CONFLICT:
             return
         self._phase = _PHASE_CONFLICT
         self._reason = _CONFLICT_REASON
         self._proposal = None
+        local_session = self._session_id
+        local_basis = self._basis
+        local_master = self._master_ip
+        if self._saved is not None and not self._committed:
+            local_session = self._saved.session_id
+            local_basis = self._saved.basis
+            local_master = self._saved.master_ip
+        if message is None:
+            logger.warning(
+                "[热冗余][身份] %s 与对端主身份矛盾，停止自动重新分配。"
+                "本机会话 %s，依据 %s，主 %s",
+                self.local_ip,
+                local_session,
+                local_basis,
+                local_master,
+            )
+            return
         logger.warning(
-            "[热冗余][身份] %s 与对端主身份矛盾，停止自动重新分配",
+            "[热冗余][身份] %s 与对端 %s 主身份矛盾，停止自动重新分配。"
+            "本机会话 %s，依据 %s，主 %s；对端会话 %s，依据 %s，主 %s",
             self.local_ip,
+            message.local_ip,
+            local_session,
+            local_basis,
+            local_master,
+            message.session_id or message.saved_session_id,
+            message.basis or message.saved_basis,
+            message.master_ip or message.saved_master_ip,
         )
 
     def _message(self, msg_type: str, **overrides: object) -> IdentityMessage:
@@ -492,6 +525,7 @@ class RedundancyIdentityAgent:
                 in (
                     _PHASE_DISCOVER,
                     _PHASE_SOLO_WAIT,
+                    _PHASE_RESTORE_WAIT,
                     _PHASE_COMPETE,
                     _PHASE_QUERY_PEER,
                 )
@@ -563,6 +597,15 @@ class RedundancyIdentityAgent:
     def _begin_solo(self, now_ms: int) -> list[bytes]:
         if self._negotiation_started or self._peer_seen or self._committed:
             return []
+        if self._saved is not None:
+            self._phase = _PHASE_RESTORE_WAIT
+            self._deadline_ms = now_ms + REDUNDANCY_IDENTITY_PROPOSAL_WAIT_MS
+            self._next_send_ms = now_ms + REDUNDANCY_IDENTITY_QUERY_INTERVAL_MS
+            logger.info(
+                "[热冗余][身份] %s 未发现对端，有已提交记录，继续等待后再恢复",
+                self.local_ip,
+            )
+            return [self._pack_query()]
         self._proposal = _Proposal(
             proposal_id=str(uuid.uuid4()),
             master_ip=self.local_ip,
@@ -586,6 +629,19 @@ class RedundancyIdentityAgent:
             peer_confirmed=False,
         )
         return [self._pack_commit()]
+
+    def _restore_saved_after_silence(self) -> list[bytes]:
+        """Peer stayed silent. Restore the saved role instead of solo-electing A."""
+        if self._negotiation_started or self._peer_seen or self._committed or self._saved is None:
+            return []
+        saved = self._saved
+        role = "A" if saved.master_ip == self.local_ip else "B"
+        logger.info(
+            "[热冗余][身份] %s 对端仍无应答，按已保存结果恢复角色 %s",
+            self.local_ip,
+            role,
+        )
+        return self._reconfirm_saved()
 
     def _enter_competition(self, now_ms: int, *, restart: bool = False) -> list[bytes]:
         if self._committed or self._phase in (_PHASE_CONFLICT, _PHASE_UNCONFIRMED):
@@ -642,13 +698,13 @@ class RedundancyIdentityAgent:
             return self._adopt_peer(message)
         relation = self._saved_relation(message)
         if relation == "conflict" and not self._committed:
-            self._mark_conflict()
+            self._mark_conflict(message)
             return []
         if relation == "match" and not self._committed:
             return self._reconfirm_saved()
         if self._committed or self._phase in (_PHASE_COMPETE, _PHASE_QUERY_PEER, _PHASE_CONFLICT):
             return []
-        if self._phase == _PHASE_SOLO_WAIT:
+        if self._phase in (_PHASE_SOLO_WAIT, _PHASE_RESTORE_WAIT):
             replies = self._revoke_current()
             return replies + self._enter_competition(now_ms)
         return self._enter_competition(now_ms)
@@ -675,7 +731,7 @@ class RedundancyIdentityAgent:
             return []
         if self._committed:
             if peer_master != self._master_ip:
-                self._mark_conflict()
+                self._mark_conflict(message)
                 return []
             if message.session_id == self._session_id or message.local_committed:
                 self._peer_confirmed = True
@@ -711,12 +767,12 @@ class RedundancyIdentityAgent:
         self._peer_seen = True
         smaller = smaller_ipv4(self.local_ip, self.peer_ip)
         if message.proposal_master_ip != smaller:
-            if self._phase in (_PHASE_DISCOVER, _PHASE_SOLO_WAIT):
+            if self._phase in (_PHASE_DISCOVER, _PHASE_SOLO_WAIT, _PHASE_RESTORE_WAIT):
                 replies = self._revoke_current()
                 return replies + self._enter_competition(now_ms)
             return []
         if self.local_ip == smaller:
-            if self._phase in (_PHASE_DISCOVER, _PHASE_SOLO_WAIT):
+            if self._phase in (_PHASE_DISCOVER, _PHASE_SOLO_WAIT, _PHASE_RESTORE_WAIT):
                 replies = self._revoke_current()
                 return replies + self._enter_competition(now_ms)
             return []
@@ -774,7 +830,7 @@ class RedundancyIdentityAgent:
                 self._persist()
                 return [self._pack_commit_ack()]
             already = self._phase == _PHASE_CONFLICT
-            self._mark_conflict()
+            self._mark_conflict(message)
             if already:
                 return []
             return [self._pack_commit()]

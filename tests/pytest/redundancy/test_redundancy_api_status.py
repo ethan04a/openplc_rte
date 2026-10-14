@@ -1,6 +1,7 @@
 """Unit tests for redundancy REST API helpers on RuntimeManager."""
 
 import threading
+import time
 from pathlib import Path
 
 from webserver.redundancy_identity import (
@@ -36,6 +37,7 @@ def _bare_runtime_manager() -> RuntimeManager:
     rm._redundancy_master_ip = None
     rm._redundancy_standby_ip = None
     rm._promoted_standby_acting_master = False
+    rm._takeover_in_progress = False
     rm.is_redundancy = False
     rm.is_master = False
     rm._plc_shadow_standby = False
@@ -254,13 +256,29 @@ def test_publish_takeover_identity_sets_a_without_election(tmp_path: Path) -> No
 def test_failed_field_switch_does_not_publish_takeover() -> None:
     rm = _bare_runtime_manager()
     rm.is_master = False
+    rm._plc_shadow_standby = True
+    rm._takeover_in_progress = True
     called: list[str] = []
     rm._publish_takeover_identity = lambda: called.append("publish")
     rm._finish_standby_takeover(False)
     assert called == []
     assert rm.is_master is False
+    assert rm._plc_shadow_standby is True
+    assert rm._promoted_standby_acting_master is False
+    assert rm._takeover_in_progress is True
     rm._finish_standby_takeover(True)
     assert called == ["publish"]
+
+
+def test_takeover_latch_blocks_a_second_promotion() -> None:
+    rm = _bare_runtime_manager()
+    rm._takeover_in_progress = True
+    started: list[str] = []
+    rm._redundancy_trigger_standby_to_master_switch = lambda: started.append("go")
+    rm._schedule_async_standby_to_master_switch()
+    time.sleep(0.1)
+    assert started == []
+    assert rm._standby_tick_lost_times(6) == (6, False)
 
 
 def test_promoted_peer_heartbeat_does_not_fail_back() -> None:
