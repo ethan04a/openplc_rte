@@ -58,6 +58,57 @@ def test_get_redundancy_heartbeat_status_disabled():
     assert payload["connection_state"] == "disabled"
 
 
+def test_peer_heartbeat_ip_is_the_other_address():
+    rm = _bare_runtime_manager()
+    rm._redundancy_master_ip = "192.168.100.10"
+    rm._redundancy_standby_ip = "192.168.100.20"
+
+    rm._redundancy_local_heartbeat_ip = "192.168.100.10"
+    rm.is_master = False
+    assert rm._redundancy_peer_heartbeat_ip() == "192.168.100.20"
+
+    rm._redundancy_local_heartbeat_ip = "192.168.100.20"
+    rm.is_master = True
+    assert rm._redundancy_peer_heartbeat_ip() == "192.168.100.10"
+
+    rm._redundancy_local_heartbeat_ip = "192.168.100.30"
+    assert rm._redundancy_peer_heartbeat_ip() is None
+    rm._redundancy_local_heartbeat_ip = None
+    assert rm._redundancy_peer_heartbeat_ip() is None
+
+
+def test_heartbeat_status_peer_ip_follows_local_heartbeat_address():
+    rm = _bare_runtime_manager()
+    rm.is_redundancy = True
+    rm.is_master = True
+    rm._redundancy_local_heartbeat_ip = "192.168.100.10"
+    rm._redundancy_master_ip = "192.168.100.10"
+    rm._redundancy_standby_ip = "192.168.100.20"
+
+    payload = rm.get_redundancy_heartbeat_status()
+    assert payload["role"] == "master"
+    assert payload["local_ip"] == "192.168.100.10"
+    assert payload["peer_ip"] == "192.168.100.20"
+
+    rm.is_master = False
+    rm._redundancy_local_heartbeat_ip = "192.168.100.20"
+    payload = rm.get_redundancy_heartbeat_status()
+    assert payload["role"] == "standby"
+    assert payload["peer_ip"] == "192.168.100.10"
+
+
+def test_image_udp_status_peer_ip_follows_local_heartbeat_address():
+    rm = _bare_runtime_manager()
+    rm.is_redundancy = True
+    rm.is_master = True
+    rm._redundancy_local_heartbeat_ip = "192.168.100.10"
+    rm._redundancy_master_ip = "192.168.100.10"
+    rm._redundancy_standby_ip = "192.168.100.20"
+
+    payload = rm.get_redundancy_image_udp_status()
+    assert payload["peer_ip"] == "192.168.100.20"
+
+
 def test_get_redundancy_image_udp_status_master_not_sent():
     rm = _bare_runtime_manager()
     rm.is_redundancy = True

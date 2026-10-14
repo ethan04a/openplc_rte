@@ -894,6 +894,19 @@ class RuntimeManager:
         with self._heartbeat_status_lock:
             self._heartbeat_lost_times = lost_times
 
+    def _redundancy_peer_heartbeat_ip(self) -> str | None:
+        """Return the other heartbeat IPv4. Role flags do not select this address."""
+        local_ip = self._redundancy_local_heartbeat_ip
+        master_ip = self._redundancy_master_ip
+        standby_ip = self._redundancy_standby_ip
+        if not local_ip or not master_ip or not standby_ip:
+            return None
+        if local_ip == master_ip:
+            return standby_ip
+        if local_ip == standby_ip:
+            return master_ip
+        return None
+
     def format_plc_status_for_api(self, raw_status: str | None) -> str:
         """Map unix STATUS response to API string; shadow standby uses RUNNING shadow."""
         if raw_status is None:
@@ -922,9 +935,7 @@ class RuntimeManager:
         else:
             role = "standby"
 
-        peer_ip = (
-            self._redundancy_standby_ip if self.is_master else self._redundancy_master_ip
-        )
+        peer_ip = self._redundancy_peer_heartbeat_ip()
         return {
             "enabled": self.is_redundancy,
             "role": role,
@@ -957,9 +968,7 @@ class RuntimeManager:
         if self._plc_image_data_plane_active:
             plc_sync = self._fetch_plc_redundancy_sync_status()
 
-        peer_ip = (
-            self._redundancy_standby_ip if self.is_master else self._redundancy_master_ip
-        )
+        peer_ip = self._redundancy_peer_heartbeat_ip()
         data_plane = "plc_main" if self._plc_image_data_plane_active else "webserver"
 
         if role == "master":
@@ -1078,11 +1087,7 @@ class RuntimeManager:
             "ack_protocol_version": REDUNDANCY_IMAGE_UDP_PROTOCOL_VERSION_V2,
             "sync_port": REDUNDANCY_IMAGE_SYNC_PORT,
             "local_heartbeat_ip": self._redundancy_local_heartbeat_ip,
-            "peer_heartbeat_ip": (
-                self._redundancy_standby_ip
-                if self.is_master
-                else self._redundancy_master_ip
-            ),
+            "peer_heartbeat_ip": self._redundancy_peer_heartbeat_ip(),
             "shadow_standby": self._plc_shadow_standby,
             "plc_running": self._plc_runtime_is_running(),
             "metadata": _redundancy_image_sync_metadata_view(stats_payload, role),
@@ -1121,11 +1126,7 @@ class RuntimeManager:
         if not self.is_redundancy:
             return False
         local_ip = self._redundancy_local_heartbeat_ip
-        peer_ip = (
-            self._redundancy_standby_ip
-            if self.is_master
-            else self._redundancy_master_ip
-        )
+        peer_ip = self._redundancy_peer_heartbeat_ip()
         if not local_ip or not peer_ip:
             return False
         mode = "master_sender" if self.is_master else "standby_receiver"
@@ -1781,8 +1782,8 @@ class RuntimeManager:
         - on_connect: TCP connect() 成功后立刻调用（pending 可能尚未由记录线程填充）。
         - periodic: 每次发送心跳前调用，消除与 _record_functional_ips_and_sync_standby_thread 的竞态。
         """
-        standby_ip = self._redundancy_standby_ip
-        if not standby_ip:
+        peer_ip = self._redundancy_peer_heartbeat_ip()
+        if not peer_ip:
             return
         with self._functional_sync_lock:
             pending = self._functional_lines_pending_sync
@@ -1795,12 +1796,12 @@ class RuntimeManager:
                 "[热冗余][主机] TCP 心跳连接已建立，开始同步 %s 中 %d 个 functional_nics permanent_master 到备机 %s。",
                 REDUNDANCY_ROLE_FILENAME,
                 len(cidrs),
-                standby_ip,
+                peer_ip,
             )
         else:
             logger.debug(
                 "[热冗余][主机] 心跳周期补发：向备机 %s 同步 %d 个 functional_nics permanent_master",
-                standby_ip,
+                peer_ip,
                 len(cidrs),
             )
 
@@ -1815,7 +1816,7 @@ class RuntimeManager:
             from webserver.redundancy_program_sync import push_role_ini_functional_to_standby
 
             pushed = push_role_ini_functional_to_standby(
-                standby_ip, cidrs, REDUNDANCY_SYNC_SECRET
+                peer_ip, cidrs, REDUNDANCY_SYNC_SECRET
             )
             if pushed:
                 self._clear_functional_lines_pending_sync()
@@ -1824,7 +1825,7 @@ class RuntimeManager:
                 logger.warning(
                     "[热冗余][主机] HTTPS 同步 functional_nics 失败（备机 %s:8443 不可达或未监听），"
                     "将在下次 TCP 心跳重连时重试；也可在备机开放 8443 或检查 Web 服务是否已启动。",
-                    standby_ip,
+                    peer_ip,
                 )
         except Exception as e:
             logger.error(
@@ -2314,7 +2315,7 @@ class RuntimeManager:
         每秒：TCP 已连接则发送心跳；否则尝试连接备机。无数、无超时切换、永久循环直至 stop。
         """
         local_ip = self._redundancy_local_heartbeat_ip
-        peer_ip = self._redundancy_standby_ip
+        peer_ip = self._redundancy_peer_heartbeat_ip()
         if not local_ip or not peer_ip:
             return
         self._reset_heartbeat_tcp_status("disconnected")
@@ -2437,7 +2438,7 @@ class RuntimeManager:
         收到原主机发来的心跳载荷后异步回切（影子 PLC + 按 functional_nics standby_backup 恢复功能 IP）。
         """
         local_ip = self._redundancy_local_heartbeat_ip
-        master_redundancy_ip = self._redundancy_master_ip
+        peer_ip = self._redundancy_peer_heartbeat_ip()
         if not local_ip:
             return
         server: socket.socket | None = None
@@ -2468,9 +2469,9 @@ class RuntimeManager:
                             break
                         logger.error("[热冗余][备机] accept 失败: %s", e)
                         continue
-                    if master_redundancy_ip and addr[0] != master_redundancy_ip:
+                    if peer_ip and addr[0] != peer_ip:
                         logger.warning(
-                            "[热冗余][备机] 升主状态下收到非配置主机冗余 IP 的连入 %s，忽略",
+                            "[热冗余][备机] 升主状态下收到非对端心跳地址的连入 %s，忽略",
                             addr[0],
                         )
                         try:
@@ -2602,11 +2603,11 @@ class RuntimeManager:
 
     def _redundancy_image_sync_master_loop(self) -> None:
         """Push full I/O snapshots at each PLC scan cycle end (UDP frame fragments)."""
-        standby_ip = self._redundancy_standby_ip
+        peer_ip = self._redundancy_peer_heartbeat_ip()
         local_ip = self._redundancy_local_heartbeat_ip
-        if not standby_ip:
+        if not peer_ip:
             logger.warning(
-                "[hot-redundancy][master] standby heartbeat IP missing; skip I/O image sync"
+                "[hot-redundancy][master] peer heartbeat IP missing; skip I/O image sync"
             )
             return
         if not local_ip:
@@ -2617,7 +2618,7 @@ class RuntimeManager:
             return
 
         sock: socket.socket | None = None
-        dest = (standby_ip, REDUNDANCY_IMAGE_SYNC_PORT)
+        dest = (peer_ip, REDUNDANCY_IMAGE_SYNC_PORT)
         session_id = self._next_redundancy_image_session_id()
         frame_seq = 0
         last_scan_counter = 0
@@ -2635,7 +2636,7 @@ class RuntimeManager:
             "[hot-redundancy][master] UDP I/O image sync (scan-end, delta preferred) "
             "(local=%s, peer=%s:%s, session=%s)",
             local_ip,
-            standby_ip,
+            peer_ip,
             REDUNDANCY_IMAGE_SYNC_PORT,
             session_id,
         )
@@ -2743,7 +2744,7 @@ class RuntimeManager:
                             )
                             continue
                         if _process_redundancy_image_master_ack(
-                            udp_stats, session_id, frame_seq, ack, standby_ip, addr
+                            udp_stats, session_id, frame_seq, ack, peer_ip, addr
                         ):
                             ack_seen = True
                             _record_redundancy_image_master_ack_latency(
@@ -2808,8 +2809,8 @@ class RuntimeManager:
     def _redundancy_image_sync_standby_loop(self) -> None:
         """Receive UDP snapshot fragments from master and apply full frames."""
         local_ip = self._redundancy_local_heartbeat_ip
-        master_ip = self._redundancy_master_ip
-        if not local_ip or not master_ip:
+        peer_ip = self._redundancy_peer_heartbeat_ip()
+        if not local_ip or not peer_ip:
             logger.warning(
                 "[hot-redundancy][standby] heartbeat NIC %s has no local IP; "
                 "skip I/O image listener",
@@ -2840,10 +2841,10 @@ class RuntimeManager:
             server.settimeout(REDUNDANCY_IMAGE_UDP_FRAME_TIMEOUT_SEC / 3)
             logger.info(
                 "[hot-redundancy][standby] UDP I/O image listener (barrier apply) %s:%s "
-                "(master=%s)",
+                "(peer=%s)",
                 local_ip,
                 REDUNDANCY_IMAGE_SYNC_PORT,
-                master_ip,
+                peer_ip,
             )
             while not self._heartbeat_stop.is_set():
                 if self._promoted_standby_acting_master:
@@ -2881,7 +2882,7 @@ class RuntimeManager:
                     )
                     continue
 
-                if addr[0] != master_ip:
+                if addr[0] != peer_ip:
                     udp_stats.bad_source_count += 1
                     logger.warning(
                         "[hot-redundancy][standby] reject UDP I/O image packet from %s:%s",

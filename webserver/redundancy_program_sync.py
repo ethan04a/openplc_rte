@@ -218,15 +218,12 @@ def push_role_ini_functional_to_standby(
 
 
 def schedule_master_to_standby_sync(runtime_manager: RuntimeManager) -> None:
-    """If this node is redundancy master, push last PLC ZIP to standby (async worker)."""
-    if not (
-        runtime_manager.is_redundancy
-        and runtime_manager.is_master
-        and runtime_manager._redundancy_standby_ip
-    ):
+    """If this node is redundancy master, push last PLC ZIP to the peer (async worker)."""
+    peer_ip = runtime_manager._redundancy_peer_heartbeat_ip()
+    if not (runtime_manager.is_redundancy and runtime_manager.is_master and peer_ip):
         return
 
-    standby_ip = runtime_manager._redundancy_standby_ip
+    standby_ip = peer_ip
 
     def worker() -> None:
         if not _wait_for_running(runtime_manager):
