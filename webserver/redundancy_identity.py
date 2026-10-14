@@ -1,0 +1,799 @@
+"""Hot-redundancy identity confirmation over UDP.
+
+This module decides who is A/master and who is B/standby. It does not start
+plc_main, heartbeat, or image sync. Callers apply a committed result later.
+
+Heartbeat addresses identify the two machines. They are not rewritten.
+Only a committed result is stored in the local state file.
+"""
+
+from __future__ import annotations
+
+import ipaddress
+import json
+import socket
+import uuid
+from dataclasses import asdict, dataclass
+from pathlib import Path
+
+from webserver.logger import get_logger
+
+logger, _ = get_logger("redundancy_identity", use_buffer=True)
+
+REDUNDANCY_IDENTITY_PORT = 57574
+REDUNDANCY_IDENTITY_MAGIC = "OPID"
+REDUNDANCY_IDENTITY_VERSION = 1
+REDUNDANCY_IDENTITY_STATE_FILENAME = "redundancy_identity_state.json"
+
+REDUNDANCY_IDENTITY_QUERY_INTERVAL_MS = 200
+REDUNDANCY_IDENTITY_DISCOVERY_WINDOW_MS = 3000
+REDUNDANCY_IDENTITY_PROPOSAL_WAIT_MS = 2000
+REDUNDANCY_IDENTITY_RETRY_LIMIT = 3
+
+BASIS_SOLO_NO_PEER = "单机未发现对端"
+BASIS_COMPETITION = "竞争胜出"
+BASIS_JOIN_INCUMBENT = "加入现任主机"
+BASIS_TAKEOVER_FACT = "升主完成后反映事实"
+BASIS_RESTORED = "恢复原分配"
+
+MSG_QUERY = "query"
+MSG_QUERY_RESPONSE = "query_response"
+MSG_PROPOSAL = "proposal"
+MSG_ACCEPT = "accept"
+MSG_COMMIT = "commit"
+MSG_COMMIT_ACK = "commit_ack"
+MSG_REVOKE = "revoke"
+
+_PHASE_DISCOVER = "discover"
+_PHASE_SOLO_WAIT = "solo_wait"
+_PHASE_COMPETE = "compete_wait"
+_PHASE_QUERY_PEER = "query_peer"
+_PHASE_COMMITTED = "committed"
+_PHASE_UNCONFIRMED = "unconfirmed"
+_PHASE_CONFLICT = "conflict"
+
+_UNCONFIRMED_REASON = "协商重试耗尽，保持未确认"
+_CONFLICT_REASON = "双方已提交的主身份矛盾"
+
+
+@dataclass
+class IdentityRecord:
+    """Committed identity stored on this machine only."""
+
+    session_id: str
+    role: str
+    basis: str
+    local_committed: bool
+    peer_confirmed: bool
+    local_ip: str
+    peer_ip: str
+    master_ip: str
+
+
+@dataclass
+class IdentityOutcome:
+    """Current confirmation view. Unconfirmed does not imply this node is master."""
+
+    status: str
+    role: str | None
+    session_id: str | None
+    basis: str | None
+    local_committed: bool
+    peer_confirmed: bool
+    master_ip: str | None
+    reason: str | None
+
+
+@dataclass
+class IdentityMessage:
+    """One identity datagram."""
+
+    msg_type: str
+    startup_instance: str
+    local_ip: str
+    peer_ip: str
+    request_id: str = ""
+    confirming: bool = False
+    has_valid_master: bool = False
+    session_id: str = ""
+    role: str = ""
+    basis: str = ""
+    local_committed: bool = False
+    peer_confirmed: bool = False
+    proposal_id: str = ""
+    proposal_master_ip: str = ""
+    proposal_session_id: str = ""
+    saved_session_id: str = ""
+    saved_role: str = ""
+    saved_master_ip: str = ""
+    saved_basis: str = ""
+    master_ip: str = ""
+
+
+@dataclass
+class _Proposal:
+    proposal_id: str
+    master_ip: str
+    session_id: str
+
+
+def ipv4_int(address: str) -> int:
+    """Compare heartbeat addresses as integers, not as strings."""
+    return int(ipaddress.IPv4Address(address))
+
+
+def smaller_ipv4(left: str, right: str) -> str:
+    return left if ipv4_int(left) <= ipv4_int(right) else right
+
+
+def pack_identity_message(message: IdentityMessage) -> bytes:
+    body = {
+        "magic": REDUNDANCY_IDENTITY_MAGIC,
+        "version": REDUNDANCY_IDENTITY_VERSION,
+        **asdict(message),
+    }
+    return json.dumps(body, separators=(",", ":"), sort_keys=True).encode("utf-8")
+
+
+def unpack_identity_message(payload: bytes) -> IdentityMessage | None:
+    try:
+        raw = json.loads(payload.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(raw, dict):
+        return None
+    if raw.get("magic") != REDUNDANCY_IDENTITY_MAGIC:
+        return None
+    if raw.get("version") != REDUNDANCY_IDENTITY_VERSION:
+        return None
+    msg_type = raw.get("msg_type")
+    if not isinstance(msg_type, str) or not msg_type:
+        return None
+    text_fields = (
+        "startup_instance",
+        "local_ip",
+        "peer_ip",
+        "request_id",
+        "session_id",
+        "role",
+        "basis",
+        "proposal_id",
+        "proposal_master_ip",
+        "proposal_session_id",
+        "saved_session_id",
+        "saved_role",
+        "saved_master_ip",
+        "saved_basis",
+        "master_ip",
+    )
+    values: dict[str, object] = {"msg_type": msg_type}
+    for name in text_fields:
+        value = raw.get(name, "")
+        if not isinstance(value, str):
+            return None
+        values[name] = value
+    for name in ("confirming", "has_valid_master", "local_committed", "peer_confirmed"):
+        value = raw.get(name, False)
+        if not isinstance(value, bool):
+            return None
+        values[name] = value
+    return IdentityMessage(**values)  # type: ignore[arg-type]
+
+
+def load_identity_record(path: Path) -> IdentityRecord | None:
+    """Load a committed record. Temporary proposals are not a record."""
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(raw, dict) or raw.get("local_committed") is not True:
+        return None
+    try:
+        record = IdentityRecord(
+            session_id=str(raw["session_id"]),
+            role=str(raw["role"]),
+            basis=str(raw["basis"]),
+            local_committed=True,
+            peer_confirmed=bool(raw.get("peer_confirmed", False)),
+            local_ip=str(raw["local_ip"]),
+            peer_ip=str(raw["peer_ip"]),
+            master_ip=str(raw["master_ip"]),
+        )
+    except (KeyError, TypeError, ValueError):
+        return None
+    if record.role not in ("A", "B") or not record.session_id:
+        return None
+    return record
+
+
+def save_identity_record(path: Path, record: IdentityRecord) -> None:
+    """Write this machine's committed result. Does not touch redundancy_role.json."""
+    if not record.local_committed:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = json.dumps(asdict(record), ensure_ascii=False, indent=2, sort_keys=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(payload + "\n", encoding="utf-8")
+    temporary.replace(path)
+
+
+class RedundancyIdentityAgent:
+    """Run discovery, solo confirm, competition, or join. Does not start the PLC."""
+
+    def __init__(
+        self,
+        local_ip: str,
+        peer_ip: str,
+        *,
+        incumbent: bool = False,
+        state_path: Path | None = None,
+        startup_instance: str | None = None,
+    ) -> None:
+        self.local_ip = local_ip
+        self.peer_ip = peer_ip
+        self.state_path = state_path
+        self.startup_instance = startup_instance or str(uuid.uuid4())
+        self._saved = self._load_saved()
+        self._phase = _PHASE_DISCOVER
+        self._reason: str | None = None
+        self._session_id = ""
+        self._role = ""
+        self._basis = ""
+        self._master_ip = ""
+        self._committed = False
+        self._peer_confirmed = False
+        self._proposal: _Proposal | None = None
+        self._accepted_proposal_id = ""
+        self._revoked: set[str] = set()
+        self._active_request_id = ""
+        self._negotiation_started = False
+        self._peer_seen = False
+        self._retry_count = 0
+        self._deadline_ms = 0
+        self._next_send_ms = 0
+        self._started = False
+        if incumbent:
+            self._hold_incumbent()
+
+    def start(self, now_ms: int) -> None:
+        """Open the discovery window. An incumbent is already committed."""
+        self._started = True
+        if self._phase == _PHASE_DISCOVER:
+            self._deadline_ms = now_ms + REDUNDANCY_IDENTITY_DISCOVERY_WINDOW_MS
+            self._next_send_ms = now_ms
+
+    @property
+    def outcome(self) -> IdentityOutcome:
+        if self._phase == _PHASE_CONFLICT:
+            status = "conflict"
+        elif self._committed:
+            status = "confirmed"
+        elif self._phase == _PHASE_UNCONFIRMED:
+            status = "unconfirmed"
+        else:
+            status = "unconfirmed"
+        return IdentityOutcome(
+            status=status,
+            role=self._role or None,
+            session_id=self._session_id or None,
+            basis=self._basis or None,
+            local_committed=self._committed,
+            peer_confirmed=self._peer_confirmed,
+            master_ip=self._master_ip or None,
+            reason=self._reason,
+        )
+
+    def commit_takeover_fact(self) -> None:
+        """Record that an existing takeover has finished. Does not run an election."""
+        if self._committed and self._role == "A" and self._basis == BASIS_TAKEOVER_FACT:
+            return
+        self._apply_commit(
+            role="A",
+            session_id=self._session_id or str(uuid.uuid4()),
+            basis=BASIS_TAKEOVER_FACT,
+            master_ip=self.local_ip,
+            peer_confirmed=self._peer_confirmed,
+        )
+
+    def poll(self, now_ms: int) -> list[bytes]:
+        """Return datagrams to send. Time is milliseconds."""
+        if not self._started or self._phase in (_PHASE_CONFLICT, _PHASE_UNCONFIRMED):
+            return []
+        if self._phase == _PHASE_DISCOVER:
+            if now_ms >= self._deadline_ms:
+                return self._begin_solo(now_ms)
+            if now_ms >= self._next_send_ms:
+                self._next_send_ms = now_ms + REDUNDANCY_IDENTITY_QUERY_INTERVAL_MS
+                return [self._pack_query()]
+            return []
+        if self._phase == _PHASE_SOLO_WAIT and now_ms >= self._deadline_ms:
+            return self._finish_solo()
+        if self._phase in (_PHASE_COMPETE, _PHASE_QUERY_PEER) and now_ms >= self._deadline_ms:
+            if self._phase == _PHASE_COMPETE:
+                self._phase = _PHASE_QUERY_PEER
+                self._deadline_ms = now_ms + REDUNDANCY_IDENTITY_PROPOSAL_WAIT_MS
+                return [self._pack_query()]
+            return self._fail_round(now_ms)
+        if self._phase == _PHASE_COMMITTED and not self._peer_confirmed:
+            if now_ms >= self._next_send_ms:
+                self._next_send_ms = now_ms + REDUNDANCY_IDENTITY_QUERY_INTERVAL_MS
+                return [self._pack_commit()]
+        return []
+
+    def handle(self, payload: bytes, now_ms: int) -> list[bytes]:
+        """Apply one peer datagram and return replies."""
+        message = unpack_identity_message(payload)
+        if message is None:
+            return []
+        if message.local_ip != self.peer_ip or message.peer_ip != self.local_ip:
+            return []
+        if message.msg_type == MSG_QUERY:
+            replies = self._react(message, now_ms, bound=False)
+            return [self._pack_response(message.request_id), *replies]
+        if message.msg_type == MSG_QUERY_RESPONSE:
+            return self._react(message, now_ms, bound=True)
+        if message.msg_type == MSG_PROPOSAL:
+            return self._on_proposal(message, now_ms)
+        if message.msg_type == MSG_ACCEPT:
+            return self._on_accept(message)
+        if message.msg_type == MSG_COMMIT:
+            return self._on_commit(message)
+        if message.msg_type == MSG_COMMIT_ACK:
+            return self._on_commit_ack(message)
+        if message.msg_type == MSG_REVOKE:
+            if message.proposal_id:
+                self._revoked.add(message.proposal_id)
+            return []
+        return []
+
+    def _load_saved(self) -> IdentityRecord | None:
+        if self.state_path is None:
+            return None
+        record = load_identity_record(self.state_path)
+        if record is None:
+            return None
+        if record.local_ip != self.local_ip or record.peer_ip != self.peer_ip:
+            return None
+        return record
+
+    def _hold_incumbent(self) -> None:
+        """This process is already master, including a promoted standby."""
+        saved = self._saved
+        if saved is not None and saved.role == "A" and saved.master_ip == self.local_ip:
+            session_id = saved.session_id
+            peer_confirmed = saved.peer_confirmed
+        else:
+            session_id = str(uuid.uuid4())
+            peer_confirmed = False
+        self._saved = None
+        self._apply_commit(
+            role="A",
+            session_id=session_id,
+            basis=BASIS_RESTORED,
+            master_ip=self.local_ip,
+            peer_confirmed=peer_confirmed,
+        )
+        logger.info(
+            "[热冗余][身份] 本机 %s 已在当主机，保留现任身份，会话 %s",
+            self.local_ip,
+            session_id,
+        )
+
+    def _apply_commit(
+        self,
+        *,
+        role: str,
+        session_id: str,
+        basis: str,
+        master_ip: str,
+        peer_confirmed: bool,
+    ) -> bool:
+        """Store a commit. Returns False when it would replace an existing result."""
+        if self._committed:
+            same = (
+                self._session_id == session_id
+                and self._role == role
+                and self._master_ip == master_ip
+            )
+            if same:
+                if peer_confirmed and not self._peer_confirmed:
+                    self._peer_confirmed = True
+                    self._persist()
+                return True
+            self._mark_conflict()
+            return False
+        self._committed = True
+        self._role = role
+        self._session_id = session_id
+        self._basis = basis
+        self._master_ip = master_ip
+        self._peer_confirmed = peer_confirmed
+        self._proposal = None
+        self._phase = _PHASE_COMMITTED
+        self._reason = None
+        self._saved = None
+        if not self._peer_confirmed:
+            self._next_send_ms = 0
+        self._persist()
+        logger.info(
+            "[热冗余][身份] %s 提交角色 %s，依据 %s，会话 %s",
+            self.local_ip,
+            role,
+            basis,
+            session_id,
+        )
+        return True
+
+    def _persist(self) -> None:
+        if self.state_path is None or not self._committed:
+            return
+        save_identity_record(
+            self.state_path,
+            IdentityRecord(
+                session_id=self._session_id,
+                role=self._role,
+                basis=self._basis,
+                local_committed=True,
+                peer_confirmed=self._peer_confirmed,
+                local_ip=self.local_ip,
+                peer_ip=self.peer_ip,
+                master_ip=self._master_ip,
+            ),
+        )
+
+    def _mark_conflict(self) -> None:
+        if self._phase == _PHASE_CONFLICT:
+            return
+        self._phase = _PHASE_CONFLICT
+        self._reason = _CONFLICT_REASON
+        self._proposal = None
+        logger.warning(
+            "[热冗余][身份] %s 与对端主身份矛盾，停止自动重新分配",
+            self.local_ip,
+        )
+
+    def _message(self, msg_type: str, **overrides: object) -> IdentityMessage:
+        saved_session = ""
+        saved_role = ""
+        saved_master = ""
+        saved_basis = ""
+        if self._saved is not None and not self._committed:
+            saved_session = self._saved.session_id
+            saved_role = self._saved.role
+            saved_master = self._saved.master_ip
+            saved_basis = self._saved.basis
+        proposal = self._proposal
+        message = IdentityMessage(
+            msg_type=msg_type,
+            startup_instance=self.startup_instance,
+            local_ip=self.local_ip,
+            peer_ip=self.peer_ip,
+            confirming=(
+                self._phase
+                in (
+                    _PHASE_DISCOVER,
+                    _PHASE_SOLO_WAIT,
+                    _PHASE_COMPETE,
+                    _PHASE_QUERY_PEER,
+                )
+            ),
+            has_valid_master=self._committed,
+            session_id=self._session_id,
+            role=self._role,
+            basis=self._basis,
+            local_committed=self._committed,
+            peer_confirmed=self._peer_confirmed,
+            proposal_id=proposal.proposal_id if proposal else "",
+            proposal_master_ip=proposal.master_ip if proposal else "",
+            proposal_session_id=proposal.session_id if proposal else "",
+            saved_session_id=saved_session,
+            saved_role=saved_role,
+            saved_master_ip=saved_master,
+            saved_basis=saved_basis,
+            master_ip=self._master_ip,
+        )
+        for key, value in overrides.items():
+            setattr(message, key, value)
+        return message
+
+    def _pack_query(self) -> bytes:
+        self._active_request_id = str(uuid.uuid4())
+        return pack_identity_message(self._message(MSG_QUERY, request_id=self._active_request_id))
+
+    def _pack_response(self, request_id: str) -> bytes:
+        return pack_identity_message(self._message(MSG_QUERY_RESPONSE, request_id=request_id))
+
+    def _pack_proposal(self) -> bytes:
+        assert self._proposal is not None
+        return pack_identity_message(
+            self._message(
+                MSG_PROPOSAL,
+                proposal_id=self._proposal.proposal_id,
+                proposal_master_ip=self._proposal.master_ip,
+                proposal_session_id=self._proposal.session_id,
+            )
+        )
+
+    def _pack_accept(self, proposal_id: str, master_ip: str, session_id: str) -> bytes:
+        return pack_identity_message(
+            self._message(
+                MSG_ACCEPT,
+                proposal_id=proposal_id,
+                proposal_master_ip=master_ip,
+                proposal_session_id=session_id,
+            )
+        )
+
+    def _pack_commit(self) -> bytes:
+        return pack_identity_message(self._message(MSG_COMMIT, master_ip=self._master_ip))
+
+    def _pack_commit_ack(self) -> bytes:
+        return pack_identity_message(self._message(MSG_COMMIT_ACK))
+
+    def _pack_revoke(self, proposal_id: str) -> bytes:
+        return pack_identity_message(self._message(MSG_REVOKE, proposal_id=proposal_id))
+
+    def _revoke_current(self) -> list[bytes]:
+        proposal = self._proposal
+        if proposal is None:
+            return []
+        self._revoked.add(proposal.proposal_id)
+        self._proposal = None
+        return [self._pack_revoke(proposal.proposal_id)]
+
+    def _begin_solo(self, now_ms: int) -> list[bytes]:
+        if self._negotiation_started or self._peer_seen or self._committed:
+            return []
+        self._proposal = _Proposal(
+            proposal_id=str(uuid.uuid4()),
+            master_ip=self.local_ip,
+            session_id=str(uuid.uuid4()),
+        )
+        self._phase = _PHASE_SOLO_WAIT
+        self._deadline_ms = now_ms + REDUNDANCY_IDENTITY_PROPOSAL_WAIT_MS
+        logger.info("[热冗余][身份] %s 未发现对端，提出担任主机", self.local_ip)
+        return [self._pack_proposal()]
+
+    def _finish_solo(self) -> list[bytes]:
+        if self._negotiation_started or self._peer_seen or self._committed:
+            return []
+        proposal = self._proposal
+        session_id = proposal.session_id if proposal else str(uuid.uuid4())
+        self._apply_commit(
+            role="A",
+            session_id=session_id,
+            basis=BASIS_SOLO_NO_PEER,
+            master_ip=self.local_ip,
+            peer_confirmed=False,
+        )
+        return [self._pack_commit()]
+
+    def _enter_competition(self, now_ms: int, *, restart: bool = False) -> list[bytes]:
+        if self._committed or self._phase in (_PHASE_CONFLICT, _PHASE_UNCONFIRMED):
+            return []
+        if self._phase == _PHASE_COMPETE and self._proposal is not None and not restart:
+            return []
+        self._negotiation_started = True
+        self._peer_seen = True
+        self._proposal = _Proposal(
+            proposal_id=str(uuid.uuid4()),
+            master_ip=self.local_ip,
+            session_id=str(uuid.uuid4()),
+        )
+        self._accepted_proposal_id = ""
+        self._phase = _PHASE_COMPETE
+        self._deadline_ms = now_ms + REDUNDANCY_IDENTITY_PROPOSAL_WAIT_MS
+        logger.info(
+            "[热冗余][身份] %s 进入双机竞争，提案 %s",
+            self.local_ip,
+            self._proposal.proposal_id,
+        )
+        return [self._pack_proposal()]
+
+    def _fail_round(self, now_ms: int) -> list[bytes]:
+        """Revoke the temporary proposal and retry. Never falls through to solo commit."""
+        self._retry_count += 1
+        replies = self._revoke_current()
+        if self._retry_count >= REDUNDANCY_IDENTITY_RETRY_LIMIT:
+            self._phase = _PHASE_UNCONFIRMED
+            self._reason = _UNCONFIRMED_REASON
+            self._proposal = None
+            logger.warning("[热冗余][身份] %s %s", self.local_ip, _UNCONFIRMED_REASON)
+            return replies
+        return replies + self._enter_competition(now_ms, restart=True)
+
+    def _saved_relation(self, message: IdentityMessage) -> str:
+        if self._saved is None or not message.saved_session_id or not message.saved_master_ip:
+            return "none"
+        same = (
+            self._saved.session_id == message.saved_session_id
+            and self._saved.master_ip == message.saved_master_ip
+        )
+        return "match" if same else "conflict"
+
+    def _react(self, message: IdentityMessage, now_ms: int, *, bound: bool) -> list[bytes]:
+        if bound and message.request_id != self._active_request_id:
+            return []
+        self._peer_seen = True
+        if self._phase == _PHASE_QUERY_PEER and bound:
+            if message.has_valid_master:
+                return self._adopt_peer(message)
+            return self._fail_round(now_ms)
+        if message.has_valid_master:
+            return self._adopt_peer(message)
+        relation = self._saved_relation(message)
+        if relation == "conflict" and not self._committed:
+            self._mark_conflict()
+            return []
+        if relation == "match" and not self._committed:
+            return self._reconfirm_saved()
+        if self._committed or self._phase in (_PHASE_COMPETE, _PHASE_QUERY_PEER, _PHASE_CONFLICT):
+            return []
+        if self._phase == _PHASE_SOLO_WAIT:
+            replies = self._revoke_current()
+            return replies + self._enter_competition(now_ms)
+        return self._enter_competition(now_ms)
+
+    def _reconfirm_saved(self) -> list[bytes]:
+        assert self._saved is not None
+        saved = self._saved
+        role = "A" if saved.master_ip == self.local_ip else "B"
+        applied = self._apply_commit(
+            role=role,
+            session_id=saved.session_id,
+            basis=BASIS_RESTORED,
+            master_ip=saved.master_ip,
+            peer_confirmed=False,
+        )
+        if not applied:
+            return []
+        return [self._pack_commit()]
+
+    def _adopt_peer(self, message: IdentityMessage) -> list[bytes]:
+        """Follow a peer that already has a committed master. Do not compare addresses."""
+        peer_master = message.master_ip or message.saved_master_ip
+        if not peer_master:
+            return []
+        if self._committed:
+            if peer_master != self._master_ip:
+                self._mark_conflict()
+                return []
+            if message.session_id == self._session_id or message.local_committed:
+                self._peer_confirmed = True
+                self._persist()
+            return [self._pack_commit_ack()]
+        if message.proposal_id and message.proposal_id in self._revoked:
+            return []
+        replies = self._revoke_current()
+        if peer_master == message.local_ip and not self._negotiation_started:
+            basis = BASIS_JOIN_INCUMBENT
+        elif self._negotiation_started:
+            basis = BASIS_COMPETITION
+        else:
+            basis = BASIS_RESTORED
+        role = "A" if peer_master == self.local_ip else "B"
+        session_id = message.session_id or str(uuid.uuid4())
+        applied = self._apply_commit(
+            role=role,
+            session_id=session_id,
+            basis=basis,
+            master_ip=peer_master,
+            peer_confirmed=True,
+        )
+        if not applied:
+            return replies
+        return replies + [self._pack_commit_ack()]
+
+    def _on_proposal(self, message: IdentityMessage, now_ms: int) -> list[bytes]:
+        if not message.proposal_id or message.proposal_id in self._revoked:
+            return []
+        if self._committed or self._phase in (_PHASE_CONFLICT, _PHASE_UNCONFIRMED):
+            return []
+        self._peer_seen = True
+        smaller = smaller_ipv4(self.local_ip, self.peer_ip)
+        if message.proposal_master_ip != smaller:
+            if self._phase in (_PHASE_DISCOVER, _PHASE_SOLO_WAIT):
+                replies = self._revoke_current()
+                return replies + self._enter_competition(now_ms)
+            return []
+        if self.local_ip == smaller:
+            if self._phase in (_PHASE_DISCOVER, _PHASE_SOLO_WAIT):
+                replies = self._revoke_current()
+                return replies + self._enter_competition(now_ms)
+            return []
+        if self._accepted_proposal_id == message.proposal_id:
+            return []
+        replies = self._revoke_current()
+        self._negotiation_started = True
+        self._accepted_proposal_id = message.proposal_id
+        self._phase = _PHASE_COMPETE
+        self._deadline_ms = now_ms + REDUNDANCY_IDENTITY_PROPOSAL_WAIT_MS
+        replies.append(
+            self._pack_accept(
+                message.proposal_id,
+                message.proposal_master_ip,
+                message.proposal_session_id,
+            )
+        )
+        return replies
+
+    def _on_accept(self, message: IdentityMessage) -> list[bytes]:
+        proposal = self._proposal
+        if proposal is None or message.proposal_id in self._revoked:
+            return []
+        if message.proposal_id != proposal.proposal_id:
+            return []
+        if message.proposal_master_ip != proposal.master_ip:
+            return []
+        smaller = smaller_ipv4(self.local_ip, self.peer_ip)
+        if proposal.master_ip != smaller or self.local_ip != smaller:
+            return []
+        if self._committed:
+            if self._session_id == proposal.session_id:
+                return [self._pack_commit()]
+            return []
+        self._apply_commit(
+            role="A",
+            session_id=proposal.session_id,
+            basis=BASIS_COMPETITION,
+            master_ip=self.local_ip,
+            peer_confirmed=False,
+        )
+        return [self._pack_commit()]
+
+    def _on_commit(self, message: IdentityMessage) -> list[bytes]:
+        if message.proposal_id and message.proposal_id in self._revoked:
+            return []
+        master_ip = message.master_ip
+        if master_ip not in (self.local_ip, self.peer_ip):
+            return []
+        if self._committed:
+            if master_ip != self._master_ip:
+                self._mark_conflict()
+                return []
+            if message.session_id == self._session_id:
+                self._peer_confirmed = True
+                self._persist()
+                return [self._pack_commit_ack()]
+            self._mark_conflict()
+            return []
+        if (
+            self._accepted_proposal_id
+            and message.proposal_id
+            and message.proposal_id != self._accepted_proposal_id
+        ):
+            return []
+        role = "A" if master_ip == self.local_ip else "B"
+        if self._negotiation_started:
+            basis = BASIS_COMPETITION
+        elif master_ip == message.local_ip and master_ip != self.local_ip:
+            basis = BASIS_JOIN_INCUMBENT
+        else:
+            basis = message.basis or BASIS_RESTORED
+        applied = self._apply_commit(
+            role=role,
+            session_id=message.session_id,
+            basis=basis,
+            master_ip=master_ip,
+            peer_confirmed=True,
+        )
+        if not applied:
+            return []
+        return [self._pack_commit_ack()]
+
+    def _on_commit_ack(self, message: IdentityMessage) -> list[bytes]:
+        if not self._committed or message.session_id != self._session_id:
+            return []
+        if self._peer_confirmed:
+            return []
+        self._peer_confirmed = True
+        self._persist()
+        return []
+
+
+def bind_identity_socket(local_ip: str, port: int = REDUNDANCY_IDENTITY_PORT) -> socket.socket:
+    """Bind the identity UDP socket. This is not the TCP heartbeat on 57575."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.bind((local_ip, port))
+    return sock
