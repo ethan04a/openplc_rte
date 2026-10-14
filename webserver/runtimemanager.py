@@ -830,7 +830,7 @@ class RuntimeManager:
         self._redundancy_local_heartbeat_ip: str | None = None
         self._heartbeat_stop = threading.Event()
         self._heartbeat_threads: list[threading.Thread] = []
-        # 备机暂时升主后为 True；升主后仍监听冗余口，收到原主机心跳载荷则异步回切
+        # 备机升主并完成现场 I/O 切换后为 True。身份写成 A 后不再因原主机心跳回切。
         self._standby_switched_to_master = False
         # True → plc_main 影子备机；暂时升主后为 False（非影子 PLC）
         self._plc_shadow_standby = False
@@ -1963,6 +1963,11 @@ class RuntimeManager:
                 outcome.reason or outcome.status,
             )
             return False
+        if outcome.status == "conflict":
+            logger.warning(
+                "[热冗余] 身份冲突，保留本机已提交角色 %s，不自动退备。",
+                outcome.role,
+            )
         if outcome.role == "A":
             self.is_master = True
             self._plc_shadow_standby = False
@@ -1982,11 +1987,7 @@ class RuntimeManager:
             return False
         if self._identity_exchange is not None:
             self._identity_exchange.stop()
-        agent = RedundancyIdentityAgent(
-            local_ip,
-            peer_ip,
-            state_path=self._openplc_project_root() / REDUNDANCY_IDENTITY_STATE_FILENAME,
-        )
+        agent = self._new_identity_agent()
         exchange = IdentityExchange(agent)
         self._identity_exchange = exchange
         exchange.start()
@@ -2002,6 +2003,34 @@ class RuntimeManager:
                 name="redundancy-record-functional-ip",
             ).start()
         return True
+
+    def _new_identity_agent(self) -> RedundancyIdentityAgent:
+        """Build the identity agent. Incumbent only if this machine already drives field I/O."""
+        local_ip = self._redundancy_local_heartbeat_ip or ""
+        peer_ip = self._redundancy_peer_heartbeat_ip() or ""
+        return RedundancyIdentityAgent(
+            local_ip,
+            peer_ip,
+            incumbent=self._running_plc_is_field_master(),
+            state_path=self._openplc_project_root() / REDUNDANCY_IDENTITY_STATE_FILENAME,
+        )
+
+    @staticmethod
+    def _cmdline_drives_field_io(cmdline: list[str] | tuple[str, ...] | None) -> bool:
+        if not cmdline:
+            return False
+        return "--shadow-standby" not in cmdline
+
+    def _running_plc_is_field_master(self) -> bool:
+        """True when plc_main is already running and is not a shadow standby."""
+        proc = self.find_running_process()
+        if proc is None or not HAS_PSUTIL or psutil is None:
+            return False
+        try:
+            cmdline = proc.cmdline()
+        except (OSError, psutil.Error):
+            return False
+        return self._cmdline_drives_field_io(cmdline)
 
     def reload_functional_nics_from_disk(self) -> None:
         """Reload functional_nics[] from redundancy_role.json (e.g. after host CIDR sync)."""
@@ -2102,11 +2131,10 @@ class RuntimeManager:
 
     def _redundancy_trigger_standby_to_master_switch(self) -> None:
         """
-        备升主（暂时）：先将本机功能口地址写入 functional_nics[].standby_backup_*，
-        再应用 functional_nics[].permanent_master_* 中记录的主机功能 IP；
-        PLC 非影子；is_master 不变；继续监听冗余口，收到原主机心跳载荷后异步回切。
+        备升主：先备份本机功能口地址，再应用 permanent_master 功能 IP。
+        现场 I/O 切换成功后，把身份写成 A，并让心跳和镜像按主机方向重连。
         """
-        logger.info("[热冗余][备机] 备机升主机已触发（暂时，JSON 中永久主备角色不变）")
+        logger.info("[热冗余][备机] 备机升主机已触发")
         if not self._redundancy_functional_nics:
             logger.error("[热冗余][备机] 升主中止：未配置功能网卡")
             return
@@ -2167,16 +2195,40 @@ class RuntimeManager:
         self._plc_shadow_standby = False
         self._promoted_standby_acting_master = True
 
+        switched = False
         try:
             if self._try_redundancy_shadow_exit():
                 logger.info(
                     "[热冗余][备机] 已通过 REDUNDANCY_SHADOW_EXIT 平滑升主（保留 PLC 进程与 I/O 镜像）"
                 )
+                switched = True
             else:
                 self._restart_plc_core_after_takeover()
+                switched = self.process is not None
         except Exception as e:
             logger.error("[热冗余][备机] 升主后切换 PLC 核心失败: %s", e)
-        # Keep redundancy heartbeat/image threads alive; switch behavior via state flags only.
+        self._finish_standby_takeover(switched)
+
+    def _finish_standby_takeover(self, switched: bool) -> None:
+        if not switched:
+            logger.error("[热冗余][备机] 现场 I/O 未切换成功，不把身份写成 A。")
+            return
+        self._publish_takeover_identity()
+
+    def _publish_takeover_identity(self) -> None:
+        """Record the finished takeover as A and point heartbeat at the peer."""
+        exchange = self._identity_exchange
+        if exchange is None:
+            logger.warning("[热冗余] 升主完成，但身份交换未在运行，仅更新本机主备标志。")
+        else:
+            exchange.agent.commit_takeover_fact()
+        self.is_master = True
+        self._plc_shadow_standby = False
+        self._standby_switched_to_master = True
+        self._promoted_standby_acting_master = True
+        logger.info("[热冗余] 升主完成，身份写成 A，不按心跳地址重新选举。")
+        if self.is_redundancy:
+            self._start_redundancy_heartbeat_threads()
 
     def _try_redundancy_shadow_exit(self) -> bool:
         """Try to enable field I/O in-process without restarting plc_main."""
@@ -2194,7 +2246,7 @@ class RuntimeManager:
             return False
 
     def _redundancy_trigger_failback_to_standby(self) -> None:
-        """收到原主机冗余心跳后回切：按 functional_nics[].standby_backup_* 恢复各功能网卡，影子 PLC。"""
+        """Restore standby addresses and a shadow PLC. Heartbeat no longer calls this."""
         logger.info("[热冗余][备机] 回切备机已触发")
         project_root = self._openplc_project_root()
         role_json_path = project_root / REDUNDANCY_ROLE_FILENAME
@@ -2332,16 +2384,13 @@ class RuntimeManager:
         threading.Thread(target=runner, daemon=True, name="async-standby-to-master").start()
 
     def _schedule_async_failback_to_standby(self) -> None:
-        """备机心跳线程内触发回切须异步执行。"""
+        """Original-master heartbeat must not demote a node that already took over."""
+        logger.info("[热冗余] 已停用原主机心跳回切。对端恢复后应作为 B 加入，本机保持 A。")
 
-        def runner() -> None:
-            time.sleep(0.05)
-            try:
-                self._redundancy_trigger_failback_to_standby()
-            except Exception as e:
-                logger.warning("[热冗余][备机] 异步回切异常: %s", e)
-
-        threading.Thread(target=runner, daemon=True, name="async-failback-standby").start()
+    def _on_promoted_peer_heartbeat(self) -> None:
+        """Keep the promoted identity when the peer heartbeat returns."""
+        logger.info("[热冗余] 已升主，收到对端心跳，保持当前主机身份，不回切。")
+        self._touch_heartbeat_activity()
 
     def _redundancy_master_tcp_heartbeat_loop(self) -> None:
         """
@@ -2467,8 +2516,7 @@ class RuntimeManager:
 
     def _redundancy_standby_tcp_heartbeat_loop(self) -> None:
         """
-        备机：纯备机态 LostTimes / 升主；暂时升主后仍监听，accept 超时不计数，
-        收到原主机发来的心跳载荷后异步回切（影子 PLC + 按 functional_nics standby_backup 恢复功能 IP）。
+        备机：纯备机态 LostTimes / 升主。升主完成前若仍在本循环里，收到对端心跳只记录活动，不回切。
         """
         local_ip = self._redundancy_local_heartbeat_ip
         peer_ip = self._redundancy_peer_heartbeat_ip()
@@ -2513,7 +2561,7 @@ class RuntimeManager:
                             pass
                         continue
                     logger.info(
-                        "[热冗余][备机] 原主机 TCP 已连入（升主监听态），对端=%s:%d，等待心跳包以回切",
+                        "[热冗余][备机] 对端 TCP 已连入（升主监听态），对端=%s:%d，不因心跳回切",
                         addr[0],
                         addr[1],
                     )
@@ -2543,17 +2591,7 @@ class RuntimeManager:
                             buf += chunk
                             buf, heartbeat_seen = self._consume_standby_redundancy_tcp_buffer(buf)
                             if heartbeat_seen:
-                                logger.info("[热冗余][备机] 收到原主机心跳，触发自动回切")
-                                self._touch_heartbeat_activity()
-                                self._schedule_async_failback_to_standby()
-                                try:
-                                    client_live.close()
-                                except OSError:
-                                    pass
-                                client_live = None
-                                break
-                            if client_live is None:
-                                break
+                                self._on_promoted_peer_heartbeat()
                     finally:
                         if client_live is not None:
                             try:

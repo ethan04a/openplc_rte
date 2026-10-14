@@ -3,7 +3,16 @@
 import threading
 from pathlib import Path
 
-from webserver.redundancy_identity import BASIS_COMPETITION, BASIS_JOIN_INCUMBENT, IdentityOutcome
+from webserver.redundancy_identity import (
+    BASIS_COMPETITION,
+    BASIS_JOIN_INCUMBENT,
+    BASIS_TAKEOVER_FACT,
+    REDUNDANCY_IDENTITY_STATE_FILENAME,
+    IdentityOutcome,
+    IdentityRecord,
+    RedundancyIdentityAgent,
+    save_identity_record,
+)
 from webserver.runtimemanager import (
     RedundancyImageUdpMasterStats,
     RedundancyImageUdpStandbyStats,
@@ -140,6 +149,132 @@ def test_apply_confirmed_identity_sets_existing_role_flags() -> None:
     assert rm._apply_confirmed_identity(standby) is True
     assert rm.is_master is False
     assert rm._plc_shadow_standby is True
+
+
+def test_conflict_keeps_committed_master_role() -> None:
+    rm = _bare_runtime_manager()
+    outcome = IdentityOutcome(
+        status="conflict",
+        role="A",
+        session_id="s",
+        basis=BASIS_TAKEOVER_FACT,
+        local_committed=True,
+        peer_confirmed=False,
+        master_ip="192.168.100.20",
+        reason="双方已提交的主身份矛盾",
+    )
+    assert rm._apply_confirmed_identity(outcome) is True
+    assert rm.is_master is True
+    assert rm._plc_shadow_standby is False
+
+
+def test_cmdline_without_shadow_drives_field_io() -> None:
+    assert RuntimeManager._cmdline_drives_field_io(["/usr/bin/plc_main"]) is True
+    assert RuntimeManager._cmdline_drives_field_io(["/usr/bin/plc_main", "--print-debug"]) is True
+    shadow = ["/usr/bin/plc_main", "--shadow-standby"]
+    assert RuntimeManager._cmdline_drives_field_io(shadow) is False
+    assert RuntimeManager._cmdline_drives_field_io(None) is False
+    assert RuntimeManager._cmdline_drives_field_io([]) is False
+
+
+def test_field_io_process_is_incumbent_even_if_history_says_standby(tmp_path: Path) -> None:
+    rm = _bare_runtime_manager()
+    rm._redundancy_local_heartbeat_ip = "192.168.100.20"
+    rm._redundancy_master_ip = "192.168.100.10"
+    rm._redundancy_standby_ip = "192.168.100.20"
+    rm._openplc_project_root = lambda: tmp_path
+    rm._running_plc_is_field_master = lambda: True
+    save_identity_record(
+        tmp_path / REDUNDANCY_IDENTITY_STATE_FILENAME,
+        IdentityRecord(
+            session_id="old",
+            role="B",
+            basis=BASIS_COMPETITION,
+            local_committed=True,
+            peer_confirmed=True,
+            local_ip="192.168.100.20",
+            peer_ip="192.168.100.10",
+            master_ip="192.168.100.10",
+        ),
+    )
+    agent = rm._new_identity_agent()
+    assert agent.outcome.local_committed is True
+    assert agent.outcome.role == "A"
+    assert agent.outcome.master_ip == "192.168.100.20"
+
+
+def test_saved_master_without_field_io_is_not_incumbent(tmp_path: Path) -> None:
+    rm = _bare_runtime_manager()
+    rm._redundancy_local_heartbeat_ip = "192.168.100.10"
+    rm._redundancy_master_ip = "192.168.100.10"
+    rm._redundancy_standby_ip = "192.168.100.20"
+    rm._openplc_project_root = lambda: tmp_path
+    rm._running_plc_is_field_master = lambda: False
+    save_identity_record(
+        tmp_path / REDUNDANCY_IDENTITY_STATE_FILENAME,
+        IdentityRecord(
+            session_id="old",
+            role="A",
+            basis=BASIS_COMPETITION,
+            local_committed=True,
+            peer_confirmed=True,
+            local_ip="192.168.100.10",
+            peer_ip="192.168.100.20",
+            master_ip="192.168.100.10",
+        ),
+    )
+    agent = rm._new_identity_agent()
+    agent.start(0)
+    assert agent.outcome.local_committed is False
+    assert isinstance(agent, RedundancyIdentityAgent)
+
+
+def test_publish_takeover_identity_sets_a_without_election(tmp_path: Path) -> None:
+    rm = _bare_runtime_manager()
+    rm.is_redundancy = True
+    rm.is_master = False
+    rm._plc_shadow_standby = True
+    agent = RedundancyIdentityAgent(
+        "192.168.100.20",
+        "192.168.100.10",
+        state_path=tmp_path / REDUNDANCY_IDENTITY_STATE_FILENAME,
+    )
+    restarted: list[str] = []
+    rm._identity_exchange = type("Exchange", (), {"agent": agent})()
+    rm._start_redundancy_heartbeat_threads = lambda: restarted.append("restart")
+    rm._publish_takeover_identity()
+    assert rm.is_master is True
+    assert rm._plc_shadow_standby is False
+    assert agent.outcome.role == "A"
+    assert agent.outcome.basis == BASIS_TAKEOVER_FACT
+    assert agent.outcome.master_ip == "192.168.100.20"
+    assert restarted == ["restart"]
+
+
+def test_failed_field_switch_does_not_publish_takeover() -> None:
+    rm = _bare_runtime_manager()
+    rm.is_master = False
+    called: list[str] = []
+    rm._publish_takeover_identity = lambda: called.append("publish")
+    rm._finish_standby_takeover(False)
+    assert called == []
+    assert rm.is_master is False
+    rm._finish_standby_takeover(True)
+    assert called == ["publish"]
+
+
+def test_promoted_peer_heartbeat_does_not_fail_back() -> None:
+    rm = _bare_runtime_manager()
+    rm.is_master = True
+    rm._plc_shadow_standby = False
+    rm._standby_switched_to_master = True
+    rm._promoted_standby_acting_master = True
+    rm._on_promoted_peer_heartbeat()
+    rm._schedule_async_failback_to_standby()
+    assert rm.is_master is True
+    assert rm._plc_shadow_standby is False
+    assert rm._standby_switched_to_master is True
+    assert rm._promoted_standby_acting_master is True
 
 
 def test_apply_unconfirmed_identity_does_not_assume_master() -> None:

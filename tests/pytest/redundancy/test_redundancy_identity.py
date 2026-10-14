@@ -352,6 +352,48 @@ def test_history_is_not_treated_as_current_master_before_discovery(tmp_path: Pat
     assert agent.outcome.role is None
 
 
+def test_takeover_replaces_standby_and_recovering_master_joins_as_b(tmp_path: Path) -> None:
+    small = _agent(IP_SMALL, IP_LARGE, tmp_path / "small.json")
+    large = _agent(IP_LARGE, IP_SMALL, tmp_path / "large.json")
+    small.start(0)
+    large.start(0)
+    _drive(small, large, 0)
+    assert large.outcome.role == "B"
+    old_session = small.outcome.session_id
+    large.commit_takeover_fact()
+    assert large.outcome.role == "A"
+    assert large.outcome.basis == BASIS_TAKEOVER_FACT
+    assert large.outcome.master_ip == IP_LARGE
+    assert large.outcome.session_id != old_session
+
+    recovered = _agent(IP_SMALL, IP_LARGE, tmp_path / "small.json")
+    assert recovered.outcome.local_committed is False
+    recovered.start(0)
+    _drive(large, recovered, 0)
+    assert large.outcome.role == "A"
+    assert large.outcome.master_ip == IP_LARGE
+    assert recovered.outcome.role == "B"
+    assert recovered.outcome.basis == BASIS_JOIN_INCUMBENT
+    assert recovered.outcome.master_ip == IP_LARGE
+    assert recovered.outcome.session_id == large.outcome.session_id
+
+
+def test_takeover_does_not_demote_a_still_running_original_master(tmp_path: Path) -> None:
+    small = _agent(IP_SMALL, IP_LARGE, tmp_path / "small.json")
+    large = _agent(IP_LARGE, IP_SMALL, tmp_path / "large.json")
+    small.start(0)
+    large.start(0)
+    _drive(small, large, 0)
+    large.commit_takeover_fact()
+    _drive(small, large, 0)
+    assert small.outcome.status == "conflict"
+    assert large.outcome.status == "conflict"
+    assert small.outcome.role == "A"
+    assert large.outcome.role == "A"
+    assert small.outcome.master_ip == IP_SMALL
+    assert large.outcome.master_ip == IP_LARGE
+
+
 def test_takeover_fact_records_local_master_without_election(tmp_path: Path) -> None:
     agent = _agent(IP_LARGE, IP_SMALL, tmp_path / "state.json")
     agent.commit_takeover_fact()

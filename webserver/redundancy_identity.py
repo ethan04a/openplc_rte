@@ -235,6 +235,7 @@ class RedundancyIdentityAgent:
         self.peer_ip = peer_ip
         self.state_path = state_path
         self.startup_instance = startup_instance or str(uuid.uuid4())
+        self._state_lock = threading.Lock()
         self._saved = self._load_saved()
         self._phase = _PHASE_DISCOVER
         self._reason: str | None = None
@@ -286,16 +287,32 @@ class RedundancyIdentityAgent:
         )
 
     def commit_takeover_fact(self) -> None:
-        """Record that an existing takeover has finished. Does not run an election."""
-        if self._committed and self._role == "A" and self._basis == BASIS_TAKEOVER_FACT:
-            return
-        self._apply_commit(
-            role="A",
-            session_id=self._session_id or str(uuid.uuid4()),
-            basis=BASIS_TAKEOVER_FACT,
-            master_ip=self.local_ip,
-            peer_confirmed=self._peer_confirmed,
-        )
+        """Record a finished takeover as A. This replaces a previous B result."""
+        with self._state_lock:
+            if (
+                self._committed
+                and self._role == "A"
+                and self._master_ip == self.local_ip
+                and self._basis == BASIS_TAKEOVER_FACT
+            ):
+                return
+            self._committed = True
+            self._role = "A"
+            self._session_id = str(uuid.uuid4())
+            self._basis = BASIS_TAKEOVER_FACT
+            self._master_ip = self.local_ip
+            self._peer_confirmed = False
+            self._proposal = None
+            self._phase = _PHASE_COMMITTED
+            self._reason = None
+            self._saved = None
+            self._next_send_ms = 0
+            self._persist()
+            logger.info(
+                "[热冗余][身份] %s 升主完成，身份写成 A，会话 %s",
+                self.local_ip,
+                self._session_id,
+            )
 
     def poll(self, now_ms: int) -> list[bytes]:
         """Return datagrams to send. Time is milliseconds."""
@@ -750,15 +767,17 @@ class RedundancyIdentityAgent:
         if master_ip not in (self.local_ip, self.peer_ip):
             return []
         if self._committed:
-            if master_ip != self._master_ip:
-                self._mark_conflict()
-                return []
-            if message.session_id == self._session_id:
+            same_master = master_ip == self._master_ip
+            same_session = message.session_id == self._session_id
+            if same_master and same_session:
                 self._peer_confirmed = True
                 self._persist()
                 return [self._pack_commit_ack()]
+            already = self._phase == _PHASE_CONFLICT
             self._mark_conflict()
-            return []
+            if already:
+                return []
+            return [self._pack_commit()]
         if (
             self._accepted_proposal_id
             and message.proposal_id
@@ -888,11 +907,10 @@ class IdentityExchange:
             self._settled.set()
 
     def _exchange(self, sock: socket.socket, now_ms: int) -> None:
-        for packet in self.agent.poll(now_ms):
-            try:
-                sock.sendto(packet, (self.agent.peer_ip, self.peer_port))
-            except OSError:
-                continue
+        with self.agent._state_lock:
+            outgoing = list(self.agent.poll(now_ms))
+        for packet in outgoing:
+            self._send(sock, packet)
         while True:
             try:
                 payload, addr = sock.recvfrom(65535)
@@ -900,8 +918,13 @@ class IdentityExchange:
                 break
             if addr[0] != self.agent.peer_ip:
                 continue
-            for reply in self.agent.handle(payload, now_ms):
-                try:
-                    sock.sendto(reply, (self.agent.peer_ip, self.peer_port))
-                except OSError:
-                    continue
+            with self.agent._state_lock:
+                replies = list(self.agent.handle(payload, now_ms))
+            for reply in replies:
+                self._send(sock, reply)
+
+    def _send(self, sock: socket.socket, packet: bytes) -> None:
+        try:
+            sock.sendto(packet, (self.agent.peer_ip, self.peer_port))
+        except OSError:
+            return
