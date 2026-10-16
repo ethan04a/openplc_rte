@@ -1,6 +1,8 @@
 #include "redundancy_udp.h"
 
 #include <arpa/inet.h>
+#include <fcntl.h>
+#include <poll.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -42,6 +44,8 @@ static redundancy_udp_config_t g_cfg;
 static pthread_t g_thread;
 static volatile int g_running = 0;
 static volatile int g_stop    = 0;
+static int g_wake_r           = -1;
+static int g_wake_w           = -1;
 static pthread_mutex_t g_stat_mutex = PTHREAD_MUTEX_INITIALIZER;
 static uint64_t g_session_id          = 1;
 static uint64_t g_frame_seq           = 0;
@@ -132,6 +136,116 @@ static int peer_addr_matches(const struct sockaddr_in *from, const char *peer_ip
         return 0;
     }
     return from->sin_addr.s_addr == expected.s_addr;
+}
+
+static void close_wake_pipe(void)
+{
+    if (g_wake_r >= 0)
+    {
+        close(g_wake_r);
+        g_wake_r = -1;
+    }
+    if (g_wake_w >= 0)
+    {
+        close(g_wake_w);
+        g_wake_w = -1;
+    }
+}
+
+static int open_wake_pipe(void)
+{
+    int fds[2];
+    int flags;
+
+    close_wake_pipe();
+    if (pipe(fds) != 0)
+    {
+        return -1;
+    }
+    flags = fcntl(fds[0], F_GETFL, 0);
+    if (flags >= 0)
+    {
+        fcntl(fds[0], F_SETFL, flags | O_NONBLOCK);
+    }
+    flags = fcntl(fds[1], F_GETFL, 0);
+    if (flags >= 0)
+    {
+        fcntl(fds[1], F_SETFL, flags | O_NONBLOCK);
+    }
+    g_wake_r = fds[0];
+    g_wake_w = fds[1];
+    return 0;
+}
+
+static void signal_receive_stop(void)
+{
+    char mark = 1;
+    if (g_wake_w >= 0)
+    {
+        (void)write(g_wake_w, &mark, 1);
+    }
+}
+
+/* 1: socket has data. 0: retry. -1: stop was requested. */
+static int wait_socket_or_stop(int sock, int timeout_ms)
+{
+    struct pollfd fds[2];
+    nfds_t count = 0;
+    nfds_t index;
+    int ready;
+
+    if (g_stop)
+    {
+        return -1;
+    }
+    if (sock >= 0)
+    {
+        fds[count].fd      = sock;
+        fds[count].events  = POLLIN;
+        fds[count].revents = 0;
+        count++;
+    }
+    if (g_wake_r >= 0)
+    {
+        fds[count].fd      = g_wake_r;
+        fds[count].events  = POLLIN;
+        fds[count].revents = 0;
+        count++;
+    }
+    if (count == 0)
+    {
+        usleep(50000);
+        return g_stop ? -1 : 0;
+    }
+    ready = poll(fds, count, timeout_ms);
+    if (g_stop)
+    {
+        return -1;
+    }
+    if (ready < 0)
+    {
+        return 0;
+    }
+    for (index = 0; index < count; index++)
+    {
+        if (fds[index].fd == g_wake_r &&
+            (fds[index].revents & (POLLIN | POLLHUP | POLLERR)))
+        {
+            char dump[32];
+            while (read(g_wake_r, dump, sizeof(dump)) > 0)
+            {
+            }
+            return -1;
+        }
+    }
+    for (index = 0; index < count; index++)
+    {
+        if (fds[index].fd == sock && (fds[index].revents & POLLIN))
+        {
+            return 1;
+        }
+    }
+    return 0;
 }
 
 static int bind_udp_socket(const char *local_ip, uint16_t port)
@@ -297,14 +411,29 @@ static void *redundancy_udp_standby_thread(void *arg)
             sock = bind_udp_socket(g_cfg.local_ip, g_cfg.udp_port);
             if (sock < 0)
             {
-                usleep(50000);
+                if (wait_socket_or_stop(-1, 50) < 0)
+                {
+                    break;
+                }
                 continue;
             }
         }
 
+        if (wait_socket_or_stop(sock, -1) <= 0)
+        {
+            if (g_stop)
+            {
+                break;
+            }
+            continue;
+        }
         n = recvfrom(sock, packet, sizeof(packet), 0, (struct sockaddr *)&from, &fromlen);
         if (n <= 0)
         {
+            if (g_stop)
+            {
+                break;
+            }
             continue;
         }
         if (!peer_addr_matches(&from, g_cfg.peer_ip))
@@ -436,10 +565,15 @@ int redundancy_udp_start(void)
         return -1;
     }
     g_stop = 0;
+    if (open_wake_pipe() != 0)
+    {
+        return -1;
+    }
     if (strstr(g_cfg.mode, "master") != NULL)
     {
         if (pthread_create(&g_thread, NULL, redundancy_udp_master_thread, NULL) != 0)
         {
+            close_wake_pipe();
             return -1;
         }
     }
@@ -447,6 +581,7 @@ int redundancy_udp_start(void)
     {
         if (pthread_create(&g_thread, NULL, redundancy_udp_standby_thread, NULL) != 0)
         {
+            close_wake_pipe();
             return -1;
         }
     }
@@ -461,8 +596,10 @@ int redundancy_udp_stop(void)
         return 0;
     }
     g_stop = 1;
+    signal_receive_stop();
     pthread_join(g_thread, NULL);
     g_running = 0;
+    close_wake_pipe();
     return 0;
 }
 

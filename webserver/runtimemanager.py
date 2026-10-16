@@ -1994,6 +1994,60 @@ class RuntimeManager:
         )
         self._reset_heartbeat_tcp_status()
 
+    def _configured_standby_functional_cidrs(self) -> list[str] | None:
+        """Return this machine's explicit standby addresses, or None when any are missing."""
+        nics = getattr(self, "_redundancy_functional_nics", None) or []
+        if not nics:
+            return []
+        backups = read_standby_backup_cidrs_for_project(self._openplc_project_root())
+        if len(backups) != len(nics) or any(not cidr for cidr in backups):
+            missing = [
+                entry.linux_ifname
+                for entry, cidr in zip(nics, list(backups) + [None] * len(nics))
+                if not cidr
+            ]
+            logger.error(
+                "[热冗余][备机] 功能网卡 %s 没有配置本机当备机时的地址"
+                "（standby_backup_ipv4_cidr_before_takeover）。"
+                "不能猜测地址，功能 IP 切换未完成。",
+                ", ".join(missing) or self._format_functional_nic_names_for_log(nics),
+            )
+            return None
+        return [str(cidr) for cidr in backups if cidr]
+
+    def _release_master_functional_ips_after_becoming_standby(self) -> bool:
+        """Drop the master functional IP and restore the configured standby address."""
+        nics = getattr(self, "_redundancy_functional_nics", None) or []
+        backups = self._configured_standby_functional_cidrs()
+        if backups is None:
+            return False
+        if not nics:
+            return True
+        permanents = read_functional_cidrs_for_project(self._openplc_project_root())
+        if len(permanents) < len(nics):
+            permanents = permanents + [None] * (len(nics) - len(permanents))
+        switched = True
+        for entry, backup, permanent in zip(nics, backups, permanents):
+            if permanent and permanent != backup:
+                if not self._ip_addr_del_on_interface(entry.linux_ifname, permanent):
+                    logger.error(
+                        "[热冗余][备机] 让出 %s 上的主机功能地址 %s 失败，功能 IP 切换未完成。",
+                        entry.linux_ifname,
+                        permanent,
+                    )
+                    switched = False
+                    continue
+            if not self._apply_ipv4_cidr_to_linux_interface(entry.linux_ifname, backup):
+                logger.error(
+                    "[热冗余][备机] 恢复 %s 的备用地址 %s 失败，功能 IP 切换未完成。",
+                    entry.linux_ifname,
+                    backup,
+                )
+                switched = False
+        if switched:
+            logger.info("[热冗余][备机] 已让出主机功能 IP，并恢复本机备用地址。")
+        return switched
+
     def _apply_confirmed_identity(self, outcome: IdentityOutcome) -> bool:
         """Write a committed A/B result into the flags the existing runtime already reads."""
         if not outcome.local_committed or outcome.role not in ("A", "B"):
@@ -2015,6 +2069,13 @@ class RuntimeManager:
         self.is_master = False
         self._plc_shadow_standby = True
         logger.info("[热冗余] 身份确认为 B／备，按影子方式启动 PLC。")
+        if outcome.status == "conflict":
+            return True
+        if not self._release_master_functional_ips_after_becoming_standby():
+            logger.error(
+                "[热冗余][备机] 已确认为备机，但功能 IP 尚未让出，不把网络切换视为完成。"
+            )
+            return False
         return True
 
     def _confirm_redundancy_identity(self) -> bool:
@@ -2123,18 +2184,48 @@ class RuntimeManager:
             self._format_functional_nic_names_for_log(self._redundancy_functional_nics),
         )
 
-    def _shutdown_redundancy_heartbeat_threads(self) -> None:
-        if self._plc_image_data_plane_active:
-            try:
-                if self.runtime_socket.is_connected():
-                    self.runtime_socket.send_message("REDUNDANCY_SYNC_STOP\n")
-            except (OSError, RuntimeError):
-                pass
-            self._plc_image_data_plane_active = False
+    def _stop_plc_image_data_plane(self) -> bool:
+        """Stop plc_main image sync and wait until that command has been answered.
+
+        The receive thread is joined inside REDUNDANCY_SYNC_STOP before OK is sent.
+        A new send direction must not start until this returns True.
+        """
+        if not self._plc_image_data_plane_active:
+            return True
+        try:
+            if not self.runtime_socket.is_connected():
+                self._safe_connect_runtime_socket()
+            if not self.runtime_socket.is_connected():
+                logger.error(
+                    "[热冗余] 无法连接 PLC 核心，旧镜像接收线程未确认退出，"
+                    "不启动新的发送方向。"
+                )
+                return False
+            resp = self.runtime_socket.send_and_receive(
+                "REDUNDANCY_SYNC_STOP\n",
+                timeout=3.0,
+            )
+        except (OSError, RuntimeError, AttributeError) as e:
+            logger.error("[热冗余] 停止旧镜像接收失败: %s。不启动新的发送方向。", e)
+            return False
+        if not resp or "REDUNDANCY_SYNC_STOP:OK" not in resp:
+            logger.error(
+                "[热冗余] 停止命令未完成（回复 %s），旧接收线程可能仍在运行，"
+                "不启动新的发送方向。",
+                resp,
+            )
+            return False
+        self._plc_image_data_plane_active = False
+        logger.info("[热冗余] 旧镜像接收线程已退出，停止命令已处理。")
+        return True
+
+    def _shutdown_redundancy_heartbeat_threads(self) -> bool:
+        image_stopped = self._stop_plc_image_data_plane()
         self._heartbeat_stop.set()
         for t in list(self._heartbeat_threads):
             t.join(timeout=3)
         self._heartbeat_threads.clear()
+        return image_stopped
 
     def _redundancy_ping_master_ipv4_once(self, ip: str) -> bool:
         """单次 ICMP ping（Linux iputils），成功返回 True。"""
@@ -3154,7 +3245,7 @@ class RuntimeManager:
             logger.info("[hot-redundancy][standby] UDP I/O image listener exited")
 
     def _start_redundancy_heartbeat_threads(self) -> None:
-        self._shutdown_redundancy_heartbeat_threads()
+        image_ready = self._shutdown_redundancy_heartbeat_threads()
         # New cycle needs a clear stop event (previous stop() left it set).
         self._heartbeat_stop = threading.Event()
         if not self.is_redundancy:
@@ -3171,6 +3262,9 @@ class RuntimeManager:
             )
             self._heartbeat_threads.append(t)
             t.start()
+            if not image_ready:
+                logger.error("[热冗余] 旧镜像接收未停止，不启动新的主机发送方向。")
+                return
             t_img = threading.Thread(
                 target=self._redundancy_image_sync_master_loop,
                 name="redundancy-master-io-sync",
@@ -3186,6 +3280,9 @@ class RuntimeManager:
         )
         self._heartbeat_threads.append(t)
         t.start()
+        if not image_ready:
+            logger.error("[热冗余] 旧镜像接收未停止，不启动新的备机接收方向。")
+            return
         t_img = threading.Thread(
             target=self._redundancy_image_sync_standby_loop,
             name="redundancy-standby-io-sync",

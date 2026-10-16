@@ -7,6 +7,7 @@ from pathlib import Path
 from webserver.redundancy_identity import (
     BASIS_COMPETITION,
     BASIS_JOIN_INCUMBENT,
+    BASIS_RESTORED,
     BASIS_TAKEOVER_FACT,
     REDUNDANCY_IDENTITY_STATE_FILENAME,
     IdentityOutcome,
@@ -14,6 +15,7 @@ from webserver.redundancy_identity import (
     RedundancyIdentityAgent,
     save_identity_record,
 )
+from webserver.redundancy_role_config import FunctionalNicRole
 from webserver.runtimemanager import (
     PlcCoreRuntimeState,
     RedundancyImageUdpMasterStats,
@@ -374,6 +376,190 @@ def test_start_does_not_launch_plc_when_identity_is_unconfirmed(tmp_path: Path) 
     rm.start()
     assert rm.running is False
     assert rm.process is None
+
+
+def _standby_outcome() -> IdentityOutcome:
+    return IdentityOutcome(
+        status="confirmed",
+        role="B",
+        session_id="s",
+        basis=BASIS_JOIN_INCUMBENT,
+        local_committed=True,
+        peer_confirmed=True,
+        master_ip="192.168.100.20",
+        reason=None,
+    )
+
+
+def test_confirmed_standby_releases_configured_master_address(monkeypatch) -> None:
+    rm = _bare_runtime_manager()
+    rm._redundancy_functional_nics = [
+        FunctionalNicRole("ens34", "192.168.10.10/24", "192.168.10.20/24")
+    ]
+    monkeypatch.setattr(
+        "webserver.runtimemanager.read_standby_backup_cidrs_for_project",
+        lambda _root: ["192.168.10.20/24"],
+    )
+    monkeypatch.setattr(
+        "webserver.runtimemanager.read_functional_cidrs_for_project",
+        lambda _root: ["192.168.10.10/24"],
+    )
+    calls: list[tuple[str, str, str]] = []
+
+    def delete(ifname: str, cidr: str) -> bool:
+        calls.append(("del", ifname, cidr))
+        return True
+
+    def apply(ifname: str, cidr: str, remove_cidr: str | None = None) -> bool:
+        calls.append(("add", ifname, cidr))
+        assert remove_cidr is None
+        return True
+
+    def guess(_ifname: str) -> str:
+        raise AssertionError("must not guess an address")
+
+    rm._ip_addr_del_on_interface = delete  # type: ignore[method-assign]
+    rm._apply_ipv4_cidr_to_linux_interface = apply  # type: ignore[method-assign]
+    rm._ipv4_cidr_for_interface = guess  # type: ignore[method-assign]
+
+    assert rm._apply_confirmed_identity(_standby_outcome()) is True
+    assert rm.is_master is False
+    assert rm._plc_shadow_standby is True
+    assert calls == [
+        ("del", "ens34", "192.168.10.10/24"),
+        ("add", "ens34", "192.168.10.20/24"),
+    ]
+
+
+def test_missing_standby_address_does_not_pretend_switch_completed(monkeypatch) -> None:
+    rm = _bare_runtime_manager()
+    rm._redundancy_functional_nics = [FunctionalNicRole("ens34", "192.168.10.10/24", None)]
+    monkeypatch.setattr(
+        "webserver.runtimemanager.read_standby_backup_cidrs_for_project",
+        lambda _root: [None],
+    )
+    calls: list[str] = []
+
+    def delete(*_args: object) -> bool:
+        calls.append("del")
+        return True
+
+    def apply(*_args: object, **_kwargs: object) -> bool:
+        calls.append("add")
+        return True
+
+    def guess(_ifname: str) -> str:
+        calls.append("guess")
+        return "192.168.10.20/24"
+
+    rm._ip_addr_del_on_interface = delete  # type: ignore[method-assign]
+    rm._apply_ipv4_cidr_to_linux_interface = apply  # type: ignore[method-assign]
+    rm._ipv4_cidr_for_interface = guess  # type: ignore[method-assign]
+
+    assert rm._apply_confirmed_identity(_standby_outcome()) is False
+    assert calls == []
+    assert rm.is_master is False
+    assert rm._plc_shadow_standby is True
+
+
+def test_conflict_does_not_release_functional_address() -> None:
+    rm = _bare_runtime_manager()
+    rm._redundancy_functional_nics = [
+        FunctionalNicRole("ens34", "192.168.10.10/24", "192.168.10.20/24")
+    ]
+    calls: list[str] = []
+    rm._release_master_functional_ips_after_becoming_standby = (  # type: ignore[method-assign]
+        lambda: calls.append("release") or False
+    )
+    outcome = IdentityOutcome(
+        status="conflict",
+        role="B",
+        session_id="s",
+        basis=BASIS_RESTORED,
+        local_committed=True,
+        peer_confirmed=False,
+        master_ip="192.168.100.10",
+        reason="双方已提交的主身份矛盾",
+    )
+    assert rm._apply_confirmed_identity(outcome) is True
+    assert calls == []
+    assert rm.is_master is False
+
+
+def test_new_sender_starts_only_after_old_receiver_stops() -> None:
+    rm = _bare_runtime_manager()
+    rm._heartbeat_threads = []
+    rm._heartbeat_stop = threading.Event()
+    rm.is_redundancy = True
+    rm.is_master = True
+    rm._plc_image_data_plane_active = True
+    order: list[str] = []
+
+    class Socket:
+        def is_connected(self) -> bool:
+            return True
+
+        def send_and_receive(self, msg: str, timeout: float = 0.5) -> str | None:
+            order.append(msg.strip())
+            if msg.startswith("REDUNDANCY_SYNC_STOP"):
+                return "REDUNDANCY_SYNC_STOP:OK"
+            return None
+
+    def heartbeat() -> None:
+        order.append("heartbeat")
+
+    def sender() -> None:
+        order.append("sender")
+
+    rm.runtime_socket = Socket()  # type: ignore[assignment]
+    rm._redundancy_master_tcp_heartbeat_loop = heartbeat  # type: ignore[method-assign]
+    rm._redundancy_image_sync_master_loop = sender  # type: ignore[method-assign]
+
+    rm._start_redundancy_heartbeat_threads()
+    for thread in list(rm._heartbeat_threads):
+        thread.join(timeout=1)
+
+    assert order[0] == "REDUNDANCY_SYNC_STOP"
+    assert "sender" in order
+    assert order.index("REDUNDANCY_SYNC_STOP") < order.index("sender")
+    assert rm._plc_image_data_plane_active is False
+
+
+def test_sender_is_not_started_when_old_receiver_does_not_stop() -> None:
+    rm = _bare_runtime_manager()
+    rm._heartbeat_threads = []
+    rm._heartbeat_stop = threading.Event()
+    rm.is_redundancy = True
+    rm.is_master = True
+    rm._plc_image_data_plane_active = True
+    order: list[str] = []
+
+    class Socket:
+        def is_connected(self) -> bool:
+            return True
+
+        def send_and_receive(self, msg: str, timeout: float = 0.5) -> str | None:
+            order.append(msg.strip())
+            return None
+
+    def heartbeat() -> None:
+        order.append("heartbeat")
+
+    def sender() -> None:
+        order.append("sender")
+
+    rm.runtime_socket = Socket()  # type: ignore[assignment]
+    rm._redundancy_master_tcp_heartbeat_loop = heartbeat  # type: ignore[method-assign]
+    rm._redundancy_image_sync_master_loop = sender  # type: ignore[method-assign]
+
+    rm._start_redundancy_heartbeat_threads()
+    for thread in list(rm._heartbeat_threads):
+        thread.join(timeout=1)
+
+    assert order[0] == "REDUNDANCY_SYNC_STOP"
+    assert "heartbeat" in order
+    assert "sender" not in order
+    assert rm._plc_image_data_plane_active is True
 
 
 def test_get_redundancy_image_udp_status_master_not_sent():
