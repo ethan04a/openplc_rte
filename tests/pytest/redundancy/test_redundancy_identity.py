@@ -583,6 +583,138 @@ def test_fresh_confirm_reply_adopts_current_master_not_stale_claim(tmp_path: Pat
     assert agent.outcome.basis == BASIS_JOIN_INCUMBENT
 
 
+def _old_matching_round(*order: str) -> list[bytes]:
+    """A previous boot's proposal and commit that agree with each other."""
+    proposal = pack_identity_message(
+        IdentityMessage(
+            msg_type="proposal",
+            startup_instance="old-boot",
+            local_ip=IP_SMALL,
+            peer_ip=IP_LARGE,
+            proposal_id="old-proposal",
+            proposal_master_ip=IP_SMALL,
+            proposal_session_id="old-session",
+        )
+    )
+    commit = pack_identity_message(
+        IdentityMessage(
+            msg_type="commit",
+            startup_instance="old-boot",
+            local_ip=IP_SMALL,
+            peer_ip=IP_LARGE,
+            proposal_id="old-proposal",
+            proposal_master_ip=IP_SMALL,
+            proposal_session_id="old-session",
+            session_id="old-session",
+            role="A",
+            basis=BASIS_COMPETITION,
+            local_committed=True,
+            has_valid_master=True,
+            master_ip=IP_SMALL,
+        )
+    )
+    if order and order[0] == "commit-first":
+        return [commit, proposal]
+    return [proposal, commit]
+
+
+def _message_types(packets: list[bytes]) -> list[str]:
+    types = []
+    for packet in packets:
+        message = unpack_identity_message(packet)
+        if message is not None:
+            types.append(message.msg_type)
+    return types
+
+
+def test_replayed_matching_proposal_and_commit_does_not_join_old_session(
+    tmp_path: Path,
+) -> None:
+    agent = _agent(IP_LARGE, IP_SMALL, tmp_path / "state.json")
+    agent.start(0)
+    first, second = _old_matching_round()
+    first_replies = agent.handle(first, 100)
+    assert "accept" not in _message_types(first_replies)
+    assert "query" in _message_types(first_replies)
+    second_replies = agent.handle(second, 100)
+    assert "commit_ack" not in _message_types(second_replies)
+    assert agent.outcome.local_committed is False
+    assert agent.outcome.session_id != "old-session"
+    now = 100
+    while now <= 6000:
+        agent.poll(now)
+        now += 50
+    assert agent.outcome.status == "confirmed"
+    assert agent.outcome.role == "A"
+    assert agent.outcome.basis == BASIS_SOLO_NO_PEER
+    assert agent.outcome.master_ip == IP_LARGE
+    assert agent.outcome.session_id != "old-session"
+
+
+def test_replayed_commit_then_proposal_still_follows_solo_confirmation(
+    tmp_path: Path,
+) -> None:
+    agent = _agent(IP_LARGE, IP_SMALL, tmp_path / "state.json")
+    agent.start(0)
+    for packet in _old_matching_round("commit-first"):
+        replies = agent.handle(packet, 100)
+        assert "commit_ack" not in _message_types(replies)
+        assert "accept" not in _message_types(replies)
+    assert agent.outcome.local_committed is False
+    now = 100
+    while now <= 6000:
+        agent.poll(now)
+        now += 50
+    assert agent.outcome.role == "A"
+    assert agent.outcome.basis == BASIS_SOLO_NO_PEER
+    assert agent.outcome.session_id != "old-session"
+
+
+def test_replayed_round_with_no_reply_restores_saved_history(tmp_path: Path) -> None:
+    path = tmp_path / "state.json"
+    save_identity_record(path, _record(IP_LARGE, IP_SMALL, "B", "kept-session", IP_SMALL))
+    agent = _agent(IP_LARGE, IP_SMALL, path)
+    agent.start(0)
+    for packet in _old_matching_round():
+        agent.handle(packet, 100)
+    now = 100
+    while now <= 8000:
+        agent.poll(now)
+        now += 50
+    assert agent.outcome.role == "B"
+    assert agent.outcome.basis == BASIS_RESTORED
+    assert agent.outcome.master_ip == IP_SMALL
+    assert agent.outcome.session_id == "kept-session"
+
+
+def test_fresh_reply_with_other_startup_discards_old_proposal(tmp_path: Path) -> None:
+    agent = _agent(IP_LARGE, IP_SMALL, tmp_path / "state.json")
+    agent.start(0)
+    proposal, commit = _old_matching_round()
+    replies = agent.handle(proposal, 100)
+    agent.handle(commit, 100)
+    response = _reply_to_confirm_query(
+        replies,
+        peer_ip=IP_SMALL,
+        local_ip=IP_LARGE,
+        session_id="live-session",
+        master_ip=IP_SMALL,
+        role="A",
+        basis=BASIS_TAKEOVER_FACT,
+        startup_instance="live-boot",
+    )
+    rewritten = unpack_identity_message(response)
+    assert rewritten is not None
+    rewritten.proposal_id = "live-proposal"
+    rewritten.proposal_master_ip = IP_SMALL
+    rewritten.proposal_session_id = "live-session"
+    agent.handle(pack_identity_message(rewritten), 150)
+    assert agent.outcome.role == "B"
+    assert agent.outcome.basis == BASIS_JOIN_INCUMBENT
+    assert agent.outcome.session_id == "live-session"
+    assert agent.outcome.master_ip == IP_SMALL
+
+
 def test_stale_commit_without_current_proposal_does_not_change_identity(tmp_path: Path) -> None:
     agent = _agent(IP_LARGE, IP_SMALL, tmp_path / "state.json")
     agent.start(0)
@@ -610,6 +742,30 @@ def test_stale_commit_without_current_proposal_does_not_change_identity(tmp_path
     ]
     assert "query" in types
     assert "commit_ack" not in types
+
+
+def test_duplicate_proposal_after_confirm_does_not_change_identity(tmp_path: Path) -> None:
+    small = _agent(IP_SMALL, IP_LARGE, tmp_path / "small.json")
+    large = _agent(IP_LARGE, IP_SMALL, tmp_path / "large.json")
+    small.start(0)
+    large.start(0)
+    proposals: list[bytes] = []
+
+    def capture(src: RedundancyIdentityAgent, packet: bytes) -> bool:
+        message = unpack_identity_message(packet)
+        if src is small and message is not None and message.msg_type == "proposal":
+            proposals.append(packet)
+        return False
+
+    _drive(small, large, 0, drop=capture)
+    assert proposals
+    session_id = large.outcome.session_id
+    assert large.outcome.role == "B"
+    replies = large.handle(proposals[-1], 50)
+    assert large.outcome.role == "B"
+    assert large.outcome.session_id == session_id
+    assert large.outcome.master_ip == IP_SMALL
+    assert "accept" in _message_types(replies)
 
 
 def test_duplicate_commit_after_confirm_does_not_change_identity(tmp_path: Path) -> None:

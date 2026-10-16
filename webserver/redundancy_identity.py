@@ -52,6 +52,7 @@ _PHASE_RESTORE_WAIT = "restore_wait"
 _PHASE_COMPETE = "compete_wait"
 _PHASE_QUERY_PEER = "query_peer"
 _PHASE_CONFIRM_CLAIM = "confirm_claim"
+_PHASE_CONFIRM_PROPOSAL = "confirm_proposal"
 _PHASE_COMMITTED = "committed"
 _PHASE_UNCONFIRMED = "unconfirmed"
 _PHASE_CONFLICT = "conflict"
@@ -254,6 +255,9 @@ class RedundancyIdentityAgent:
         self._accepted_session_id = ""
         self._accepted_master_ip = ""
         self._accepted_startup_instance = ""
+        self._accepted_local_startup = ""
+        self._staged_proposal: _Proposal | None = None
+        self._staged_peer_startup = ""
         self._phase_before_confirm = ""
         self._deadline_before_confirm = 0
         self._persist_retry = False
@@ -344,9 +348,13 @@ class RedundancyIdentityAgent:
                 logger.error("[热冗余][身份] %s 身份记录保存重试失败", self.local_ip)
         if not self._started or self._phase in (_PHASE_CONFLICT, _PHASE_UNCONFIRMED):
             return outgoing
-        if self._phase == _PHASE_CONFIRM_CLAIM:
+        if self._phase in (_PHASE_CONFIRM_CLAIM, _PHASE_CONFIRM_PROPOSAL):
             if now_ms >= self._deadline_ms:
-                return outgoing + self._finish_confirm_timeout(now_ms)
+                if self._phase == _PHASE_CONFIRM_PROPOSAL:
+                    finished = self._finish_confirm_proposal_timeout(now_ms)
+                else:
+                    finished = self._finish_confirm_timeout(now_ms)
+                return outgoing + finished
             if now_ms >= self._next_send_ms:
                 self._next_send_ms = now_ms + REDUNDANCY_IDENTITY_QUERY_INTERVAL_MS
                 return outgoing + [self._pack_query()]
@@ -602,6 +610,7 @@ class RedundancyIdentityAgent:
                     _PHASE_COMPETE,
                     _PHASE_QUERY_PEER,
                     _PHASE_CONFIRM_CLAIM,
+                    _PHASE_CONFIRM_PROPOSAL,
                 )
             ),
             has_valid_master=self._committed,
@@ -731,6 +740,7 @@ class RedundancyIdentityAgent:
             session_id=str(uuid.uuid4()),
         )
         self._clear_accepted_proposal()
+        self._clear_staged_proposal()
         self._phase = _PHASE_COMPETE
         self._deadline_ms = now_ms + REDUNDANCY_IDENTITY_PROPOSAL_WAIT_MS
         logger.info(
@@ -766,15 +776,26 @@ class RedundancyIdentityAgent:
         self._accepted_session_id = ""
         self._accepted_master_ip = ""
         self._accepted_startup_instance = ""
+        self._accepted_local_startup = ""
 
-    def _remember_accepted_proposal(self, message: IdentityMessage) -> None:
-        self._accepted_proposal_id = message.proposal_id
-        self._accepted_session_id = message.proposal_session_id
-        self._accepted_master_ip = message.proposal_master_ip
-        self._accepted_startup_instance = message.startup_instance
+    def _clear_staged_proposal(self) -> None:
+        self._staged_proposal = None
+        self._staged_peer_startup = ""
+
+    def _remember_staged_as_accepted(self) -> None:
+        staged = self._staged_proposal
+        if staged is None:
+            return
+        self._accepted_proposal_id = staged.proposal_id
+        self._accepted_session_id = staged.session_id
+        self._accepted_master_ip = staged.master_ip
+        self._accepted_startup_instance = self._staged_peer_startup
+        self._accepted_local_startup = self.startup_instance
 
     def _competition_commit_matches(self, message: IdentityMessage) -> bool:
         if not self._accepted_proposal_id:
+            return False
+        if self._accepted_local_startup != self.startup_instance:
             return False
         if message.proposal_id != self._accepted_proposal_id:
             return False
@@ -782,12 +803,19 @@ class RedundancyIdentityAgent:
             return False
         if message.master_ip != self._accepted_master_ip:
             return False
-        if (
-            self._accepted_startup_instance
-            and message.startup_instance != self._accepted_startup_instance
-        ):
+        if message.startup_instance != self._accepted_startup_instance:
             return False
         return True
+
+    def _same_accepted_proposal(self, message: IdentityMessage) -> bool:
+        return bool(
+            self._accepted_proposal_id
+            and message.proposal_id == self._accepted_proposal_id
+            and message.proposal_session_id == self._accepted_session_id
+            and message.proposal_master_ip == self._accepted_master_ip
+            and message.startup_instance == self._accepted_startup_instance
+            and self._accepted_local_startup == self.startup_instance
+        )
 
     def _same_committed_claim(self, message: IdentityMessage) -> bool:
         peer_master = message.master_ip or message.saved_master_ip
@@ -799,7 +827,12 @@ class RedundancyIdentityAgent:
 
     def _begin_confirm_claim(self, message: IdentityMessage, now_ms: int) -> list[bytes]:
         """Ask the peer again. Do not accept an unbound 'I am master' claim yet."""
-        if self._phase in (_PHASE_CONFIRM_CLAIM, _PHASE_CONFLICT, _PHASE_UNCONFIRMED):
+        if self._phase in (
+            _PHASE_CONFIRM_CLAIM,
+            _PHASE_CONFIRM_PROPOSAL,
+            _PHASE_CONFLICT,
+            _PHASE_UNCONFIRMED,
+        ):
             return []
         if self._same_committed_claim(message):
             if not self._peer_confirmed:
@@ -834,11 +867,146 @@ class RedundancyIdentityAgent:
             return self._begin_solo(now_ms)
         return []
 
+    def _begin_confirm_proposal(self, message: IdentityMessage, now_ms: int) -> list[bytes]:
+        """Stage a proposal and ask whether it belongs to this startup pair.
+
+        The proposal is not accepted, and it does not count as the peer being
+        online for this boot, until a reply to this new request confirms it.
+        """
+        if self._phase in (
+            _PHASE_CONFIRM_PROPOSAL,
+            _PHASE_CONFIRM_CLAIM,
+            _PHASE_CONFLICT,
+            _PHASE_UNCONFIRMED,
+        ):
+            return []
+        if (
+            not message.proposal_id
+            or not message.proposal_session_id
+            or not message.proposal_master_ip
+            or not message.startup_instance
+        ):
+            return []
+        self._staged_proposal = _Proposal(
+            proposal_id=message.proposal_id,
+            master_ip=message.proposal_master_ip,
+            session_id=message.proposal_session_id,
+        )
+        self._staged_peer_startup = message.startup_instance
+        self._phase_before_confirm = self._phase
+        self._deadline_before_confirm = self._deadline_ms
+        self._phase = _PHASE_CONFIRM_PROPOSAL
+        self._deadline_ms = now_ms + REDUNDANCY_IDENTITY_PROPOSAL_WAIT_MS
+        self._next_send_ms = now_ms + REDUNDANCY_IDENTITY_QUERY_INTERVAL_MS
+        logger.info(
+            "[热冗余][身份] %s 收到提案 %s，先向 %s 核实是否属于本次启动",
+            self.local_ip,
+            message.proposal_id,
+            message.local_ip,
+        )
+        return [self._pack_query()]
+
+    def _staged_proposal_matches(self, message: IdentityMessage) -> bool:
+        """True when this reply binds both current startups to the staged round."""
+        staged = self._staged_proposal
+        if staged is None or not self._staged_peer_startup:
+            return False
+        if message.startup_instance != self._staged_peer_startup:
+            return False
+        if message.proposal_id != staged.proposal_id:
+            return False
+        if message.proposal_session_id != staged.session_id:
+            return False
+        if message.proposal_master_ip != staged.master_ip:
+            return False
+        if message.has_valid_master or message.local_committed:
+            if message.master_ip != staged.master_ip:
+                return False
+            if message.session_id != staged.session_id:
+                return False
+        return True
+
+    def _accept_verified_proposal(self, now_ms: int) -> list[bytes]:
+        staged = self._staged_proposal
+        if staged is None:
+            return []
+        self._remember_staged_as_accepted()
+        self._clear_staged_proposal()
+        self._phase_before_confirm = ""
+        self._deadline_before_confirm = 0
+        replies = self._revoke_current()
+        self._negotiation_started = True
+        self._peer_seen = True
+        self._phase = _PHASE_COMPETE
+        self._deadline_ms = now_ms + REDUNDANCY_IDENTITY_PROPOSAL_WAIT_MS
+        logger.info(
+            "[热冗余][身份] %s 提案 %s 已通过本次确认，接受。本机启动 %s，对端启动 %s",
+            self.local_ip,
+            self._accepted_proposal_id,
+            self.startup_instance,
+            self._accepted_startup_instance,
+        )
+        replies.append(
+            self._pack_accept(
+                self._accepted_proposal_id,
+                self._accepted_master_ip,
+                self._accepted_session_id,
+            )
+        )
+        return replies
+
+    def _finish_confirm_proposal(self, message: IdentityMessage, now_ms: int) -> list[bytes]:
+        """Accept the staged proposal only when this request's reply confirms it."""
+        matched = self._staged_proposal_matches(message)
+        previous = self._phase_before_confirm or _PHASE_DISCOVER
+        previous_deadline = self._deadline_before_confirm
+        if matched and (message.has_valid_master or message.local_committed):
+            replies = self._accept_verified_proposal(now_ms)
+            replies.extend(self._commit_unconfirmed_peer(message))
+            return replies
+        if matched:
+            return self._accept_verified_proposal(now_ms)
+        self._clear_staged_proposal()
+        self._phase_before_confirm = ""
+        self._deadline_before_confirm = 0
+        self._phase = previous
+        self._deadline_ms = previous_deadline
+        logger.info(
+            "[热冗余][身份] %s 本次回复与暂存提案不一致，丢弃该提案",
+            self.local_ip,
+        )
+        return self._react(message, now_ms, bound=True)
+
+    def _finish_confirm_proposal_timeout(self, now_ms: int) -> list[bytes]:
+        """Drop the staged proposal. Do not treat it as the peer being online."""
+        previous = self._phase_before_confirm or _PHASE_DISCOVER
+        previous_deadline = self._deadline_before_confirm
+        self._clear_staged_proposal()
+        self._phase = previous
+        self._deadline_ms = previous_deadline
+        self._phase_before_confirm = ""
+        self._deadline_before_confirm = 0
+        logger.info(
+            "[热冗余][身份] %s 提案未得到本次确认，忽略该提案",
+            self.local_ip,
+        )
+        if previous == _PHASE_DISCOVER and now_ms >= self._deadline_ms:
+            return self._begin_solo(now_ms)
+        if previous == _PHASE_SOLO_WAIT and now_ms >= self._deadline_ms:
+            return self._finish_solo()
+        if previous == _PHASE_RESTORE_WAIT and now_ms >= self._deadline_ms:
+            return self._restore_saved_after_silence()
+        return []
+
     def _react(self, message: IdentityMessage, now_ms: int, *, bound: bool) -> list[bytes]:
         if bound and message.request_id != self._active_request_id:
             return []
         if self._phase in (_PHASE_CONFLICT, _PHASE_UNCONFIRMED):
             return []
+        if self._phase == _PHASE_CONFIRM_PROPOSAL:
+            if not bound:
+                return []
+            return self._finish_confirm_proposal(message, now_ms)
         if message.has_valid_master and not bound:
             return self._begin_confirm_claim(message, now_ms)
         self._peer_seen = True
@@ -920,35 +1088,28 @@ class RedundancyIdentityAgent:
     def _on_proposal(self, message: IdentityMessage, now_ms: int) -> list[bytes]:
         if not message.proposal_id or message.proposal_id in self._revoked:
             return []
-        if self._committed or self._phase in (_PHASE_CONFLICT, _PHASE_UNCONFIRMED):
+        if self._phase in (_PHASE_CONFLICT, _PHASE_UNCONFIRMED):
             return []
-        self._peer_seen = True
+        if self._same_accepted_proposal(message):
+            # A repeated proposal may be answered again. It must not move identity.
+            return [
+                self._pack_accept(
+                    message.proposal_id,
+                    message.proposal_master_ip,
+                    message.proposal_session_id,
+                )
+            ]
+        if self._committed or self._phase in (_PHASE_CONFIRM_PROPOSAL, _PHASE_CONFIRM_CLAIM):
+            return []
         smaller = smaller_ipv4(self.local_ip, self.peer_ip)
-        if message.proposal_master_ip != smaller:
+        would_accept = message.proposal_master_ip == smaller and self.local_ip != smaller
+        if not would_accept:
             if self._phase in (_PHASE_DISCOVER, _PHASE_SOLO_WAIT, _PHASE_RESTORE_WAIT):
+                self._peer_seen = True
                 replies = self._revoke_current()
                 return replies + self._enter_competition(now_ms)
             return []
-        if self.local_ip == smaller:
-            if self._phase in (_PHASE_DISCOVER, _PHASE_SOLO_WAIT, _PHASE_RESTORE_WAIT):
-                replies = self._revoke_current()
-                return replies + self._enter_competition(now_ms)
-            return []
-        if self._accepted_proposal_id == message.proposal_id:
-            return []
-        replies = self._revoke_current()
-        self._negotiation_started = True
-        self._remember_accepted_proposal(message)
-        self._phase = _PHASE_COMPETE
-        self._deadline_ms = now_ms + REDUNDANCY_IDENTITY_PROPOSAL_WAIT_MS
-        replies.append(
-            self._pack_accept(
-                message.proposal_id,
-                message.proposal_master_ip,
-                message.proposal_session_id,
-            )
-        )
-        return replies
+        return self._begin_confirm_proposal(message, now_ms)
 
     def _on_accept(self, message: IdentityMessage) -> list[bytes]:
         proposal = self._proposal
@@ -977,6 +1138,8 @@ class RedundancyIdentityAgent:
 
     def _on_commit(self, message: IdentityMessage, now_ms: int) -> list[bytes]:
         if self._phase in (_PHASE_CONFLICT, _PHASE_UNCONFIRMED):
+            return []
+        if self._phase == _PHASE_CONFIRM_PROPOSAL and not self._committed:
             return []
         if message.proposal_id and message.proposal_id in self._revoked:
             return []
