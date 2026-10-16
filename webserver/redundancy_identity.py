@@ -51,12 +51,14 @@ _PHASE_SOLO_WAIT = "solo_wait"
 _PHASE_RESTORE_WAIT = "restore_wait"
 _PHASE_COMPETE = "compete_wait"
 _PHASE_QUERY_PEER = "query_peer"
+_PHASE_CONFIRM_CLAIM = "confirm_claim"
 _PHASE_COMMITTED = "committed"
 _PHASE_UNCONFIRMED = "unconfirmed"
 _PHASE_CONFLICT = "conflict"
 
 _UNCONFIRMED_REASON = "协商重试耗尽，保持未确认"
 _CONFLICT_REASON = "双方已提交的主身份矛盾"
+_PERSIST_FAILED_REASON = "身份记录保存失败，保持未确认"
 
 
 @dataclass
@@ -247,7 +249,14 @@ class RedundancyIdentityAgent:
         self._committed = False
         self._peer_confirmed = False
         self._proposal: _Proposal | None = None
+        self._last_proposal: _Proposal | None = None
         self._accepted_proposal_id = ""
+        self._accepted_session_id = ""
+        self._accepted_master_ip = ""
+        self._accepted_startup_instance = ""
+        self._phase_before_confirm = ""
+        self._deadline_before_confirm = 0
+        self._persist_retry = False
         self._revoked: set[str] = set()
         self._active_request_id = ""
         self._negotiation_started = False
@@ -297,6 +306,8 @@ class RedundancyIdentityAgent:
                 and self._basis == BASIS_TAKEOVER_FACT
             ):
                 return
+            # Field I/O already moved. Keep that fact even if the file write fails.
+            self._remember_proposal()
             self._committed = True
             self._role = "A"
             self._session_id = str(uuid.uuid4())
@@ -308,7 +319,13 @@ class RedundancyIdentityAgent:
             self._reason = None
             self._saved = None
             self._next_send_ms = 0
-            self._persist()
+            if not self._persist():
+                self._persist_retry = True
+                logger.error(
+                    "[热冗余][身份] %s 升主已完成，但身份记录保存失败，将重试。会话 %s",
+                    self.local_ip,
+                    self._session_id,
+                )
             logger.info(
                 "[热冗余][身份] %s 升主完成，身份写成 A，会话 %s",
                 self.local_ip,
@@ -317,8 +334,23 @@ class RedundancyIdentityAgent:
 
     def poll(self, now_ms: int) -> list[bytes]:
         """Return datagrams to send. Time is milliseconds."""
+        outgoing: list[bytes] = []
+        if self._persist_retry and self._committed and now_ms >= self._next_send_ms:
+            if self._persist():
+                self._persist_retry = False
+                logger.info("[热冗余][身份] %s 身份记录保存重试成功", self.local_ip)
+            else:
+                self._next_send_ms = now_ms + REDUNDANCY_IDENTITY_QUERY_INTERVAL_MS
+                logger.error("[热冗余][身份] %s 身份记录保存重试失败", self.local_ip)
         if not self._started or self._phase in (_PHASE_CONFLICT, _PHASE_UNCONFIRMED):
-            return []
+            return outgoing
+        if self._phase == _PHASE_CONFIRM_CLAIM:
+            if now_ms >= self._deadline_ms:
+                return outgoing + self._finish_confirm_timeout(now_ms)
+            if now_ms >= self._next_send_ms:
+                self._next_send_ms = now_ms + REDUNDANCY_IDENTITY_QUERY_INTERVAL_MS
+                return outgoing + [self._pack_query()]
+            return outgoing
         if self._phase == _PHASE_DISCOVER:
             if now_ms >= self._deadline_ms:
                 return self._begin_solo(now_ms)
@@ -364,7 +396,7 @@ class RedundancyIdentityAgent:
         if message.msg_type == MSG_ACCEPT:
             return self._on_accept(message)
         if message.msg_type == MSG_COMMIT:
-            return self._on_commit(message)
+            return self._on_commit(message, now_ms)
         if message.msg_type == MSG_COMMIT_ACK:
             return self._on_commit_ack(message)
         if message.msg_type == MSG_REVOKE:
@@ -399,6 +431,7 @@ class RedundancyIdentityAgent:
             basis=BASIS_RESTORED,
             master_ip=self.local_ip,
             peer_confirmed=peer_confirmed,
+            persist_required=False,
         )
         logger.info(
             "[热冗余][身份] 本机 %s 已在当主机，保留现任身份，会话 %s",
@@ -414,6 +447,7 @@ class RedundancyIdentityAgent:
         basis: str,
         master_ip: str,
         peer_confirmed: bool,
+        persist_required: bool = True,
     ) -> bool:
         """Store a commit. Returns False when it would replace an existing result."""
         if self._committed:
@@ -425,10 +459,28 @@ class RedundancyIdentityAgent:
             if same:
                 if peer_confirmed and not self._peer_confirmed:
                     self._peer_confirmed = True
-                    self._persist()
+                    if not self._persist():
+                        self._persist_retry = True
                 return True
             self._mark_conflict()
             return False
+        record = IdentityRecord(
+            session_id=session_id,
+            role=role,
+            basis=basis,
+            local_committed=True,
+            peer_confirmed=peer_confirmed,
+            local_ip=self.local_ip,
+            peer_ip=self.peer_ip,
+            master_ip=master_ip,
+        )
+        if persist_required and not self._write_record(record):
+            self._phase = _PHASE_UNCONFIRMED
+            self._reason = _PERSIST_FAILED_REASON
+            self._proposal = None
+            logger.error("[热冗余][身份] %s %s", self.local_ip, _PERSIST_FAILED_REASON)
+            return False
+        self._remember_proposal()
         self._committed = True
         self._role = role
         self._session_id = session_id
@@ -441,7 +493,12 @@ class RedundancyIdentityAgent:
         self._saved = None
         if not self._peer_confirmed:
             self._next_send_ms = 0
-        self._persist()
+        if not persist_required and not self._write_record(record):
+            self._persist_retry = True
+            logger.error(
+                "[热冗余][身份] %s 身份已生效，但记录保存失败，将重试",
+                self.local_ip,
+            )
         logger.info(
             "[热冗余][身份] %s 提交角色 %s，依据 %s，会话 %s",
             self.local_ip,
@@ -451,11 +508,27 @@ class RedundancyIdentityAgent:
         )
         return True
 
-    def _persist(self) -> None:
+    def _remember_proposal(self) -> None:
+        if self._proposal is not None:
+            self._last_proposal = self._proposal
+
+    def _current_proposal(self) -> _Proposal | None:
+        return self._proposal or self._last_proposal
+
+    def _write_record(self, record: IdentityRecord) -> bool:
+        if self.state_path is None:
+            return True
+        try:
+            save_identity_record(self.state_path, record)
+            return True
+        except OSError as exc:
+            logger.error("[热冗余][身份] %s 保存身份记录失败: %s", self.local_ip, exc)
+            return False
+
+    def _persist(self) -> bool:
         if self.state_path is None or not self._committed:
-            return
-        save_identity_record(
-            self.state_path,
+            return True
+        return self._write_record(
             IdentityRecord(
                 session_id=self._session_id,
                 role=self._role,
@@ -465,7 +538,7 @@ class RedundancyIdentityAgent:
                 local_ip=self.local_ip,
                 peer_ip=self.peer_ip,
                 master_ip=self._master_ip,
-            ),
+            )
         )
 
     def _mark_conflict(self, message: IdentityMessage | None = None) -> None:
@@ -514,7 +587,7 @@ class RedundancyIdentityAgent:
             saved_role = self._saved.role
             saved_master = self._saved.master_ip
             saved_basis = self._saved.basis
-        proposal = self._proposal
+        proposal = self._current_proposal()
         message = IdentityMessage(
             msg_type=msg_type,
             startup_instance=self.startup_instance,
@@ -528,6 +601,7 @@ class RedundancyIdentityAgent:
                     _PHASE_RESTORE_WAIT,
                     _PHASE_COMPETE,
                     _PHASE_QUERY_PEER,
+                    _PHASE_CONFIRM_CLAIM,
                 )
             ),
             has_valid_master=self._committed,
@@ -621,13 +695,14 @@ class RedundancyIdentityAgent:
             return []
         proposal = self._proposal
         session_id = proposal.session_id if proposal else str(uuid.uuid4())
-        self._apply_commit(
+        if not self._apply_commit(
             role="A",
             session_id=session_id,
             basis=BASIS_SOLO_NO_PEER,
             master_ip=self.local_ip,
             peer_confirmed=False,
-        )
+        ):
+            return []
         return [self._pack_commit()]
 
     def _restore_saved_after_silence(self) -> list[bytes]:
@@ -655,7 +730,7 @@ class RedundancyIdentityAgent:
             master_ip=self.local_ip,
             session_id=str(uuid.uuid4()),
         )
-        self._accepted_proposal_id = ""
+        self._clear_accepted_proposal()
         self._phase = _PHASE_COMPETE
         self._deadline_ms = now_ms + REDUNDANCY_IDENTITY_PROPOSAL_WAIT_MS
         logger.info(
@@ -686,10 +761,92 @@ class RedundancyIdentityAgent:
         )
         return "match" if same else "conflict"
 
+    def _clear_accepted_proposal(self) -> None:
+        self._accepted_proposal_id = ""
+        self._accepted_session_id = ""
+        self._accepted_master_ip = ""
+        self._accepted_startup_instance = ""
+
+    def _remember_accepted_proposal(self, message: IdentityMessage) -> None:
+        self._accepted_proposal_id = message.proposal_id
+        self._accepted_session_id = message.proposal_session_id
+        self._accepted_master_ip = message.proposal_master_ip
+        self._accepted_startup_instance = message.startup_instance
+
+    def _competition_commit_matches(self, message: IdentityMessage) -> bool:
+        if not self._accepted_proposal_id:
+            return False
+        if message.proposal_id != self._accepted_proposal_id:
+            return False
+        if not message.session_id or message.session_id != self._accepted_session_id:
+            return False
+        if message.master_ip != self._accepted_master_ip:
+            return False
+        if (
+            self._accepted_startup_instance
+            and message.startup_instance != self._accepted_startup_instance
+        ):
+            return False
+        return True
+
+    def _same_committed_claim(self, message: IdentityMessage) -> bool:
+        peer_master = message.master_ip or message.saved_master_ip
+        return bool(
+            self._committed
+            and peer_master == self._master_ip
+            and (message.session_id == self._session_id or message.local_committed)
+        )
+
+    def _begin_confirm_claim(self, message: IdentityMessage, now_ms: int) -> list[bytes]:
+        """Ask the peer again. Do not accept an unbound 'I am master' claim yet."""
+        if self._phase in (_PHASE_CONFIRM_CLAIM, _PHASE_CONFLICT, _PHASE_UNCONFIRMED):
+            return []
+        if self._same_committed_claim(message):
+            if not self._peer_confirmed:
+                self._peer_confirmed = True
+                if not self._persist():
+                    self._persist_retry = True
+            return [self._pack_commit_ack()] if message.msg_type == MSG_COMMIT else []
+        self._phase_before_confirm = self._phase
+        self._deadline_before_confirm = self._deadline_ms
+        self._phase = _PHASE_CONFIRM_CLAIM
+        self._deadline_ms = now_ms + REDUNDANCY_IDENTITY_PROPOSAL_WAIT_MS
+        self._next_send_ms = now_ms + REDUNDANCY_IDENTITY_QUERY_INTERVAL_MS
+        logger.info(
+            "[热冗余][身份] %s 收到主机声明，先向 %s 发起本次确认",
+            self.local_ip,
+            message.local_ip,
+        )
+        return [self._pack_query()]
+
+    def _finish_confirm_timeout(self, now_ms: int) -> list[bytes]:
+        previous = self._phase_before_confirm or _PHASE_DISCOVER
+        previous_deadline = self._deadline_before_confirm
+        self._phase = previous
+        self._deadline_ms = previous_deadline
+        self._phase_before_confirm = ""
+        self._deadline_before_confirm = 0
+        logger.info(
+            "[热冗余][身份] %s 对端主机声明未得到本次确认，忽略该声明",
+            self.local_ip,
+        )
+        if previous == _PHASE_DISCOVER and now_ms >= self._deadline_ms:
+            return self._begin_solo(now_ms)
+        return []
+
     def _react(self, message: IdentityMessage, now_ms: int, *, bound: bool) -> list[bytes]:
         if bound and message.request_id != self._active_request_id:
             return []
+        if self._phase in (_PHASE_CONFLICT, _PHASE_UNCONFIRMED):
+            return []
+        if message.has_valid_master and not bound:
+            return self._begin_confirm_claim(message, now_ms)
         self._peer_seen = True
+        if self._phase == _PHASE_CONFIRM_CLAIM and bound:
+            if message.has_valid_master:
+                return self._adopt_peer(message)
+            self._phase = self._phase_before_confirm or _PHASE_DISCOVER
+            self._phase_before_confirm = ""
         if self._phase == _PHASE_QUERY_PEER and bound:
             if message.has_valid_master:
                 return self._adopt_peer(message)
@@ -735,7 +892,8 @@ class RedundancyIdentityAgent:
                 return []
             if message.session_id == self._session_id or message.local_committed:
                 self._peer_confirmed = True
-                self._persist()
+                if not self._persist():
+                    self._persist_retry = True
             return [self._pack_commit_ack()]
         if message.proposal_id and message.proposal_id in self._revoked:
             return []
@@ -780,7 +938,7 @@ class RedundancyIdentityAgent:
             return []
         replies = self._revoke_current()
         self._negotiation_started = True
-        self._accepted_proposal_id = message.proposal_id
+        self._remember_accepted_proposal(message)
         self._phase = _PHASE_COMPETE
         self._deadline_ms = now_ms + REDUNDANCY_IDENTITY_PROPOSAL_WAIT_MS
         replies.append(
@@ -807,16 +965,19 @@ class RedundancyIdentityAgent:
             if self._session_id == proposal.session_id:
                 return [self._pack_commit()]
             return []
-        self._apply_commit(
+        if not self._apply_commit(
             role="A",
             session_id=proposal.session_id,
             basis=BASIS_COMPETITION,
             master_ip=self.local_ip,
             peer_confirmed=False,
-        )
+        ):
+            return []
         return [self._pack_commit()]
 
-    def _on_commit(self, message: IdentityMessage) -> list[bytes]:
+    def _on_commit(self, message: IdentityMessage, now_ms: int) -> list[bytes]:
+        if self._phase in (_PHASE_CONFLICT, _PHASE_UNCONFIRMED):
+            return []
         if message.proposal_id and message.proposal_id in self._revoked:
             return []
         master_ip = message.master_ip
@@ -827,19 +988,18 @@ class RedundancyIdentityAgent:
             same_session = message.session_id == self._session_id
             if same_master and same_session:
                 self._peer_confirmed = True
-                self._persist()
+                if not self._persist():
+                    self._persist_retry = True
                 return [self._pack_commit_ack()]
-            already = self._phase == _PHASE_CONFLICT
-            self._mark_conflict(message)
-            if already:
+            return self._begin_confirm_claim(message, now_ms)
+        if self._accepted_proposal_id:
+            if not self._competition_commit_matches(message):
                 return []
-            return [self._pack_commit()]
-        if (
-            self._accepted_proposal_id
-            and message.proposal_id
-            and message.proposal_id != self._accepted_proposal_id
-        ):
-            return []
+            return self._commit_unconfirmed_peer(message)
+        return self._begin_confirm_claim(message, now_ms)
+
+    def _commit_unconfirmed_peer(self, message: IdentityMessage) -> list[bytes]:
+        master_ip = message.master_ip
         role = "A" if master_ip == self.local_ip else "B"
         if self._negotiation_started:
             basis = BASIS_COMPETITION
@@ -864,7 +1024,8 @@ class RedundancyIdentityAgent:
         if self._peer_confirmed:
             return []
         self._peer_confirmed = True
-        self._persist()
+        if not self._persist():
+            self._persist_retry = True
         return []
 
 

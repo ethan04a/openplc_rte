@@ -10,4 +10,10 @@
  */
 void redundancy_shadow_exit_response(char *response, size_t response_size);
 
+/**
+ * Report whether plc_main is RUNNING, still in shadow standby, and driving field I/O.
+ * Writes REDUNDANCY_ROLE_STATUS:running=0|1,shadow=0|1,field_io=0|1
+ */
+void redundancy_role_status_response(char *response, size_t response_size);
+
 #endif /* REDUNDANCY_IPC_H */

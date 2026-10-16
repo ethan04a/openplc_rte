@@ -83,3 +83,20 @@ out:
         PyGILState_Release(gstate);
     }
 }
+
+void redundancy_role_status_response(char *response, size_t response_size)
+{
+    int running;
+    int shadow;
+    int field_io;
+
+    if (!response || response_size == 0)
+    {
+        return;
+    }
+    running  = plc_get_state() == PLC_STATE_RUNNING;
+    shadow   = (plugin_driver && plugin_driver->shadow_standby) ? 1 : 0;
+    field_io = (running && !shadow) ? 1 : 0;
+    snprintf(response, response_size, "REDUNDANCY_ROLE_STATUS:running=%d,shadow=%d,field_io=%d\n",
+             running, shadow, field_io);
+}

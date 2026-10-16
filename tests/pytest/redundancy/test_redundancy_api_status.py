@@ -15,9 +15,11 @@ from webserver.redundancy_identity import (
     save_identity_record,
 )
 from webserver.runtimemanager import (
+    PlcCoreRuntimeState,
     RedundancyImageUdpMasterStats,
     RedundancyImageUdpStandbyStats,
     RuntimeManager,
+    parse_redundancy_role_status,
 )
 
 
@@ -177,6 +179,50 @@ def test_cmdline_without_shadow_drives_field_io() -> None:
     assert RuntimeManager._cmdline_drives_field_io(shadow) is False
     assert RuntimeManager._cmdline_drives_field_io(None) is False
     assert RuntimeManager._cmdline_drives_field_io([]) is False
+
+
+def test_parse_redundancy_role_status() -> None:
+    parsed = parse_redundancy_role_status(
+        "REDUNDANCY_ROLE_STATUS:running=1,shadow=0,field_io=1\n"
+    )
+    assert parsed == PlcCoreRuntimeState(running=True, shadow=False, field_io=True)
+    shadow = parse_redundancy_role_status(
+        "REDUNDANCY_ROLE_STATUS:running=1,shadow=1,field_io=0"
+    )
+    assert shadow == PlcCoreRuntimeState(running=True, shadow=True, field_io=False)
+    assert parse_redundancy_role_status("COMMAND:ERROR") is None
+    assert parse_redundancy_role_status(None) is None
+
+
+def test_running_field_master_uses_core_state_not_cmdline() -> None:
+    rm = _bare_runtime_manager()
+    rm._query_plc_core_runtime_state = lambda: PlcCoreRuntimeState(
+        running=True, shadow=False, field_io=True
+    )
+    assert rm._running_plc_is_field_master() is True
+    rm._query_plc_core_runtime_state = lambda: PlcCoreRuntimeState(
+        running=True, shadow=True, field_io=False
+    )
+    assert rm._running_plc_is_field_master() is False
+    rm._query_plc_core_runtime_state = lambda: None
+    assert rm._running_plc_is_field_master() is False
+
+
+def test_takeover_fallback_requires_live_field_io_not_process_object() -> None:
+    rm = _bare_runtime_manager()
+    rm.process = object()
+    rm._query_plc_core_runtime_state = lambda: None
+    assert rm._takeover_switch_succeeded(in_process=False) is False
+    rm._query_plc_core_runtime_state = lambda: PlcCoreRuntimeState(
+        running=False, shadow=False, field_io=False
+    )
+    assert rm._takeover_switch_succeeded(in_process=False) is False
+    rm._query_plc_core_runtime_state = lambda: PlcCoreRuntimeState(
+        running=True, shadow=False, field_io=True
+    )
+    assert rm._takeover_switch_succeeded(in_process=False) is True
+    rm._query_plc_core_runtime_state = lambda: None
+    assert rm._takeover_switch_succeeded(in_process=True) is True
 
 
 def test_field_io_process_is_incumbent_even_if_history_says_standby(tmp_path: Path) -> None:

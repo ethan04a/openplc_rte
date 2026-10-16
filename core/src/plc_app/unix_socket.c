@@ -251,6 +251,10 @@ void handle_unix_socket_commands(const char *command, char *response, size_t res
     {
         redundancy_shadow_exit_response(response, response_size);
     }
+    else if (strcmp(command, "REDUNDANCY_ROLE_STATUS") == 0)
+    {
+        redundancy_role_status_response(response, response_size);
+    }
     else if (strncmp(command, "REDUNDANCY_SYNC_CONFIG:", 22) == 0)
     {
         if (redundancy_udp_configure(command + 22) == 0)

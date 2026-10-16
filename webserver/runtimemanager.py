@@ -118,6 +118,42 @@ REDUNDANCY_STANDBY_LOST_THRESHOLD_SEC = 5
 PLC_STATUS_CACHE_TTL_SEC = 0.2
 
 
+@dataclass
+class PlcCoreRuntimeState:
+    """Live plc_main role reported by the core, not by launch arguments."""
+
+    running: bool
+    shadow: bool
+    field_io: bool
+
+
+def parse_redundancy_role_status(response: str | None) -> PlcCoreRuntimeState | None:
+    """Parse REDUNDANCY_ROLE_STATUS:running=0|1,shadow=0|1,field_io=0|1"""
+    if not response:
+        return None
+    text = response.strip()
+    prefix = "REDUNDANCY_ROLE_STATUS:"
+    if not text.startswith(prefix):
+        return None
+    values: dict[str, bool] = {}
+    for part in text[len(prefix) :].split(","):
+        if "=" not in part:
+            return None
+        key, value = part.split("=", 1)
+        key = key.strip()
+        value = value.strip()
+        if value not in ("0", "1"):
+            return None
+        values[key] = value == "1"
+    if not {"running", "shadow", "field_io"} <= values.keys():
+        return None
+    return PlcCoreRuntimeState(
+        running=values["running"],
+        shadow=values["shadow"],
+        field_io=values["field_io"],
+    )
+
+
 @dataclass(frozen=True)
 class RedundancyImageUdpFragment:
     session_id: int
@@ -2024,16 +2060,54 @@ class RuntimeManager:
             return False
         return "--shadow-standby" not in cmdline
 
-    def _running_plc_is_field_master(self) -> bool:
-        """True when plc_main is already running and is not a shadow standby."""
-        proc = self.find_running_process()
-        if proc is None or not HAS_PSUTIL or psutil is None:
-            return False
+    def _query_plc_core_runtime_state(self) -> PlcCoreRuntimeState | None:
+        """Ask the running PLC core whether it is RUNNING, shadow, and driving field I/O."""
+        if self.find_running_process() is None and not self.is_runtime_alive():
+            return None
         try:
-            cmdline = proc.cmdline()
-        except (OSError, psutil.Error):
+            if not self.runtime_socket.is_connected():
+                self._safe_connect_runtime_socket()
+            if not self.runtime_socket.is_connected():
+                return None
+            status = self.runtime_socket.send_and_receive("STATUS\n", timeout=0.5)
+            role = self.runtime_socket.send_and_receive("REDUNDANCY_ROLE_STATUS\n", timeout=0.5)
+        except (OSError, RuntimeError, TypeError, ValueError, AttributeError):
+            return None
+        parsed = parse_redundancy_role_status(role)
+        if parsed is None:
+            return None
+        running = status == "STATUS:RUNNING" and parsed.running
+        shadow = parsed.shadow
+        field_io = bool(parsed.field_io and running and not shadow)
+        return PlcCoreRuntimeState(running=running, shadow=shadow, field_io=field_io)
+
+    def _running_plc_is_field_master(self) -> bool:
+        """True when the running PLC core is live and already driving field I/O."""
+        state = self._query_plc_core_runtime_state()
+        if state is None:
             return False
-        return self._cmdline_drives_field_io(cmdline)
+        return state.running and state.field_io and not state.shadow
+
+    def _takeover_switch_succeeded(self, *, in_process: bool) -> bool:
+        """Confirm field I/O is actually active after a takeover attempt."""
+        state = self._query_plc_core_runtime_state()
+        if in_process:
+            if state is None:
+                return True
+            return state.running and state.field_io and not state.shadow
+        if state is None:
+            logger.error("[热冗余][备机] 已重启非影子 plc_main，但无法查询核心现场 I/O 状态")
+            return False
+        if not (state.running and state.field_io and not state.shadow):
+            logger.error(
+                "[热冗余][备机] 已重启非影子 plc_main，但核心未进入现场 I/O 运行"
+                "（running=%s shadow=%s field_io=%s）",
+                state.running,
+                state.shadow,
+                state.field_io,
+            )
+            return False
+        return True
 
     def reload_functional_nics_from_disk(self) -> None:
         """Reload functional_nics[] from redundancy_role.json (e.g. after host CIDR sync)."""
@@ -2212,10 +2286,10 @@ class RuntimeManager:
                 logger.info(
                     "[热冗余][备机] 已通过 REDUNDANCY_SHADOW_EXIT 平滑升主（保留 PLC 进程与 I/O 镜像）"
                 )
-                switched = True
+                switched = self._takeover_switch_succeeded(in_process=True)
             else:
                 self._restart_plc_core_after_takeover()
-                switched = self.process is not None
+                switched = self._takeover_switch_succeeded(in_process=False)
         except Exception as e:
             logger.error("[热冗余][备机] 升主后切换 PLC 核心失败: %s", e)
         self._finish_standby_takeover(switched)

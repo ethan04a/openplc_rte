@@ -21,6 +21,7 @@ from webserver.redundancy_identity import (
     pack_identity_message,
     save_identity_record,
     unpack_identity_message,
+    _PERSIST_FAILED_REASON,
 )
 
 IP_SMALL = "192.168.100.10"
@@ -424,6 +425,41 @@ def test_saved_master_is_restored_when_peer_is_silent(tmp_path: Path) -> None:
     assert agent.outcome.session_id == "old-session"
 
 
+def _reply_to_confirm_query(
+    replies: list[bytes],
+    *,
+    peer_ip: str,
+    local_ip: str,
+    session_id: str,
+    master_ip: str,
+    role: str,
+    basis: str,
+    startup_instance: str = "peer",
+) -> bytes:
+    query = None
+    for packet in replies:
+        message = unpack_identity_message(packet)
+        if message is not None and message.msg_type == "query" and message.request_id:
+            query = message
+            break
+    assert query is not None
+    return pack_identity_message(
+        IdentityMessage(
+            msg_type="query_response",
+            startup_instance=startup_instance,
+            local_ip=peer_ip,
+            peer_ip=local_ip,
+            request_id=query.request_id,
+            has_valid_master=True,
+            local_committed=True,
+            session_id=session_id,
+            role=role,
+            basis=basis,
+            master_ip=master_ip,
+        )
+    )
+
+
 def test_saved_master_joins_peer_during_restore_wait(tmp_path: Path) -> None:
     path = tmp_path / "state.json"
     save_identity_record(path, _record(IP_SMALL, IP_LARGE, "A", "old-session", IP_SMALL))
@@ -443,7 +479,20 @@ def test_saved_master_joins_peer_during_restore_wait(tmp_path: Path) -> None:
         basis=BASIS_TAKEOVER_FACT,
         master_ip=IP_LARGE,
     )
-    agent.handle(pack_identity_message(peer), 3500)
+    replies = agent.handle(pack_identity_message(peer), 3500)
+    assert agent.outcome.local_committed is False
+    agent.handle(
+        _reply_to_confirm_query(
+            replies,
+            peer_ip=IP_LARGE,
+            local_ip=IP_SMALL,
+            session_id="takeover-session",
+            master_ip=IP_LARGE,
+            role="A",
+            basis=BASIS_TAKEOVER_FACT,
+        ),
+        3500,
+    )
     assert agent.outcome.role == "B"
     assert agent.outcome.basis == BASIS_JOIN_INCUMBENT
     assert agent.outcome.master_ip == IP_LARGE
@@ -461,6 +510,175 @@ def test_takeover_fact_records_local_master_without_election(tmp_path: Path) -> 
     assert outcome.basis == BASIS_TAKEOVER_FACT
     assert outcome.master_ip == IP_LARGE
     assert load_identity_record(tmp_path / "state.json") is not None
+
+
+def test_stale_master_query_is_not_adopted_without_fresh_reply(tmp_path: Path) -> None:
+    agent = _agent(IP_SMALL, IP_LARGE, tmp_path / "state.json")
+    agent.start(0)
+    stale = pack_identity_message(
+        IdentityMessage(
+            msg_type="query",
+            startup_instance="old-boot",
+            local_ip=IP_LARGE,
+            peer_ip=IP_SMALL,
+            has_valid_master=True,
+            local_committed=True,
+            session_id="old-session",
+            role="A",
+            basis=BASIS_SOLO_NO_PEER,
+            master_ip=IP_LARGE,
+        )
+    )
+    replies = agent.handle(stale, 100)
+    assert agent.outcome.local_committed is False
+    assert agent.outcome.role is None
+    types = []
+    for packet in replies:
+        message = unpack_identity_message(packet)
+        if message is not None:
+            types.append(message.msg_type)
+    assert "query_response" in types
+    assert "query" in types
+    now = 100
+    while now <= 2500:
+        agent.poll(now)
+        now += 50
+    assert agent.outcome.local_committed is False
+    assert agent.outcome.role is None
+
+
+def test_fresh_confirm_reply_adopts_current_master_not_stale_claim(tmp_path: Path) -> None:
+    agent = _agent(IP_SMALL, IP_LARGE, tmp_path / "state.json")
+    agent.start(0)
+    stale = pack_identity_message(
+        IdentityMessage(
+            msg_type="query",
+            startup_instance="old-boot",
+            local_ip=IP_LARGE,
+            peer_ip=IP_SMALL,
+            has_valid_master=True,
+            local_committed=True,
+            session_id="old-session",
+            role="A",
+            basis=BASIS_SOLO_NO_PEER,
+            master_ip=IP_LARGE,
+        )
+    )
+    replies = agent.handle(stale, 100)
+    agent.handle(
+        _reply_to_confirm_query(
+            replies,
+            peer_ip=IP_LARGE,
+            local_ip=IP_SMALL,
+            session_id="live-session",
+            master_ip=IP_LARGE,
+            role="A",
+            basis=BASIS_TAKEOVER_FACT,
+            startup_instance="live-boot",
+        ),
+        150,
+    )
+    assert agent.outcome.role == "B"
+    assert agent.outcome.session_id == "live-session"
+    assert agent.outcome.basis == BASIS_JOIN_INCUMBENT
+
+
+def test_stale_commit_without_current_proposal_does_not_change_identity(tmp_path: Path) -> None:
+    agent = _agent(IP_LARGE, IP_SMALL, tmp_path / "state.json")
+    agent.start(0)
+    stale = pack_identity_message(
+        IdentityMessage(
+            msg_type="commit",
+            startup_instance="old-boot",
+            local_ip=IP_SMALL,
+            peer_ip=IP_LARGE,
+            session_id="old-session",
+            role="A",
+            basis=BASIS_SOLO_NO_PEER,
+            local_committed=True,
+            has_valid_master=True,
+            master_ip=IP_SMALL,
+        )
+    )
+    replies = agent.handle(stale, 100)
+    assert agent.outcome.local_committed is False
+    assert agent.outcome.role is None
+    types = [
+        unpack_identity_message(packet).msg_type
+        for packet in replies
+        if unpack_identity_message(packet) is not None
+    ]
+    assert "query" in types
+    assert "commit_ack" not in types
+
+
+def test_duplicate_commit_after_confirm_does_not_change_identity(tmp_path: Path) -> None:
+    small = _agent(IP_SMALL, IP_LARGE, tmp_path / "small.json")
+    large = _agent(IP_LARGE, IP_SMALL, tmp_path / "large.json")
+    small.start(0)
+    large.start(0)
+    _drive(small, large, 0)
+    session_id = small.outcome.session_id
+    assert session_id is not None
+    duplicate = pack_identity_message(
+        IdentityMessage(
+            msg_type="commit",
+            startup_instance="boot-192.168.100.10",
+            local_ip=IP_SMALL,
+            peer_ip=IP_LARGE,
+            session_id=session_id,
+            role="A",
+            basis=BASIS_COMPETITION,
+            local_committed=True,
+            has_valid_master=True,
+            master_ip=IP_SMALL,
+        )
+    )
+    replies = large.handle(duplicate, 50)
+    assert large.outcome.role == "B"
+    assert large.outcome.session_id == session_id
+    assert large.outcome.master_ip == IP_SMALL
+    types = [
+        unpack_identity_message(packet).msg_type
+        for packet in replies
+        if unpack_identity_message(packet) is not None
+    ]
+    assert "commit_ack" in types
+
+
+def test_persist_failure_on_first_commit_stays_unconfirmed(
+    tmp_path: Path, monkeypatch
+) -> None:
+    def boom(*_args, **_kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr("webserver.redundancy_identity.save_identity_record", boom)
+    agent = _agent(IP_SMALL, IP_LARGE, tmp_path / "state.json")
+    agent.start(0)
+    now = 0
+    while now <= 5000:
+        agent.poll(now)
+        now += 50
+    assert agent.outcome.status == "unconfirmed"
+    assert agent.outcome.local_committed is False
+    assert agent.outcome.role is None
+    assert agent.outcome.reason == _PERSIST_FAILED_REASON
+    assert not (tmp_path / "state.json").exists()
+
+
+def test_takeover_persist_failure_keeps_memory_role(tmp_path: Path, monkeypatch) -> None:
+    agent = _agent(IP_LARGE, IP_SMALL, tmp_path / "state.json")
+
+    def boom(*_args, **_kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr("webserver.redundancy_identity.save_identity_record", boom)
+    agent.commit_takeover_fact()
+    assert agent.outcome.role == "A"
+    assert agent.outcome.local_committed is True
+    assert agent.outcome.basis == BASIS_TAKEOVER_FACT
+    assert agent.outcome.master_ip == IP_LARGE
+    assert load_identity_record(tmp_path / "state.json") is None
 
 
 def test_uncommitted_file_is_not_restored(tmp_path: Path) -> None:
